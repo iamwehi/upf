@@ -1,68 +1,98 @@
 //! UPF — a scalable UnifiedPush push server backed by FoundationDB.
 //!
-//! Architecture (see `docs`/plan): three roles share one FDB cluster.
-//!  * WebPush ingress (RFC 8030) — application servers `POST` here.
-//!  * Distributor gateway — distributors connect over WebSocket.
-//!  * Storage — subscriptions + per-subscription message queue in FDB.
+//! Three roles share one FDB cluster and communicate *only* through it — there
+//! is no service-to-service RPC:
+//!  * **Writer** ([`writer`]) — application servers `POST` here (RFC 8030 WebPush).
+//!  * **Pusher** ([`pusher`]) — distributors connect over WebSocket; it watches
+//!    shard bells and drains durable queues.
+//!  * **Janitor** ([`janitor`]) — expires TTL'd messages and sweeps dead nodes.
+//!
+//! A single binary can run any subset of roles (`UPF_ROLES`); the walking-skeleton
+//! default runs all three in one process, still coordinating purely via FDB.
 
 pub mod config;
-pub mod distributor;
 pub mod error;
-pub mod storage;
+pub mod hash;
+pub mod janitor;
+pub mod keyspace;
+pub mod model;
+pub mod protocol;
+pub mod pusher;
+pub mod store;
 pub mod token;
-pub mod webpush;
+pub mod writer;
 
 use std::sync::Arc;
 
 use axum::Router;
 use axum::routing::{get, post};
 
-use crate::config::Config;
-use crate::distributor::registry::Registry;
-use crate::storage::Storage;
+use crate::config::{Config, Role};
+use crate::pusher::Pusher;
+use crate::store::Store;
 
 /// Shared application state handed to every request handler.
 ///
-/// Cheaply cloneable: everything behind an `Arc`.
+/// Cheaply cloneable: everything behind an `Arc`. `pusher` is present only when
+/// this process runs the pusher role.
 #[derive(Clone)]
 pub struct AppState {
-    pub storage: Arc<Storage>,
-    pub registry: Arc<Registry>,
+    pub store: Arc<Store>,
     pub config: Arc<Config>,
+    pub pusher: Option<Arc<Pusher>>,
 }
 
-/// Build the axum router for the whole server.
+/// Build the axum router, mounting only the routes for this process's roles.
 pub fn router(state: AppState) -> Router {
-    Router::new()
-        .route("/healthz", get(healthz))
-        .route("/push/{token}", post(webpush::ingress::push))
-        .route("/distributor/ws", get(distributor::ws::handler))
-        .with_state(state)
+    let mut router = Router::new().route("/healthz", get(healthz));
+    if state.config.has_role(Role::Writer) {
+        router = router.route("/push/{token}", post(writer::push));
+    }
+    if state.config.has_role(Role::Pusher) {
+        router = router.route("/distributor/ws", get(pusher::ws::handler));
+    }
+    router.with_state(state)
 }
 
 async fn healthz() -> &'static str {
     "ok"
 }
 
-/// Boot FoundationDB, wire up state, and serve until shutdown.
+/// Boot FoundationDB, wire up the enabled roles, and serve until shutdown.
 pub async fn run() -> anyhow::Result<()> {
     init_tracing();
 
-    let config = Config::from_env();
-    tracing::info!(bind = %config.bind, public_url = %config.public_url, "starting upf");
+    let config = Arc::new(Config::from_env());
+    let roles: Vec<String> = config.roles.iter().map(|r| r.to_string()).collect();
+    tracing::info!(
+        bind = %config.bind,
+        public_url = %config.public_url,
+        node = %config.node_id,
+        roles = %roles.join(","),
+        "starting upf"
+    );
 
     // The FDB network must be booted exactly once and the guard kept alive for
-    // the lifetime of the process. Dropping it cleanly shuts the client down.
-    // SAFETY: called once, before any other FDB API use, and `_network` is held
-    // until `run` returns (i.e. until the server stops).
+    // the lifetime of the process. SAFETY: called once, before any other FDB API
+    // use, and `_network` is held until `run` returns.
     let _network = unsafe { foundationdb::boot() };
 
-    let storage = Arc::new(Storage::connect()?);
-    let registry = Arc::new(Registry::new());
+    let store = Arc::new(Store::connect(config.shard_count)?);
+
+    // Start background roles.
+    let pusher = if config.has_role(Role::Pusher) {
+        Some(Pusher::start(store.clone(), config.clone()))
+    } else {
+        None
+    };
+    if config.has_role(Role::Janitor) {
+        janitor::start(store.clone(), config.clone());
+    }
+
     let state = AppState {
-        storage,
-        registry,
-        config: Arc::new(config.clone()),
+        store,
+        config: config.clone(),
+        pusher,
     };
 
     let listener = tokio::net::TcpListener::bind(&config.bind).await?;
@@ -77,8 +107,8 @@ pub async fn run() -> anyhow::Result<()> {
 
 fn init_tracing() {
     use tracing_subscriber::EnvFilter;
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("upf=debug,info"));
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("upf=debug,info"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
 }
 

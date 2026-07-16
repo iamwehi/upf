@@ -21,6 +21,9 @@ pub enum Error {
     #[error("foundationdb transaction error: {0}")]
     FdbTxn(#[from] foundationdb::FdbBindingError),
 
+    #[error("tuple decode error: {0}")]
+    Tuple(String),
+
     #[error("serialization error: {0}")]
     Serde(#[from] serde_json::Error),
 
@@ -30,15 +33,23 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+impl From<foundationdb::tuple::PackError> for Error {
+    fn from(e: foundationdb::tuple::PackError) -> Self {
+        Error::Tuple(e.to_string())
+    }
+}
+
 impl IntoResponse for Error {
     fn into_response(self) -> Response {
         let status = match &self {
             Error::NotFound => StatusCode::NOT_FOUND,
             Error::PayloadTooLarge(..) => StatusCode::PAYLOAD_TOO_LARGE,
             Error::BadRequest(_) => StatusCode::BAD_REQUEST,
-            Error::Fdb(_) | Error::FdbTxn(_) | Error::Serde(_) | Error::Other(_) => {
-                StatusCode::INTERNAL_SERVER_ERROR
-            }
+            Error::Fdb(_)
+            | Error::FdbTxn(_)
+            | Error::Tuple(_)
+            | Error::Serde(_)
+            | Error::Other(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         // 5xx details are logged, not leaked to the caller.
         if status.is_server_error() {

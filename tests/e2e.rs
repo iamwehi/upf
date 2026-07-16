@@ -1,4 +1,8 @@
-//! End-to-end walking-skeleton test against a real FoundationDB.
+//! End-to-end test of the FDB-only architecture against a real FoundationDB.
+//!
+//! Exercises the full path: register over WS → POST reaches the durable queue →
+//! writer pokes the pusher's inbox/bell → pusher drains and delivers → ack →
+//! offline push rests in `Q` → reconnect + `subscribe` replays it.
 //!
 //! Requires the FDB network (booted once here) and a reachable cluster via
 //! `FDB_CLUSTER_FILE`. Run with `scripts/cargo.sh test`.
@@ -12,9 +16,9 @@ use tokio_tungstenite::tungstenite::Message;
 
 use upf::AppState;
 use upf::config::Config;
-use upf::distributor::protocol::{ClientFrame, ServerFrame};
-use upf::distributor::registry::Registry;
-use upf::storage::Storage;
+use upf::protocol::{ClientFrame, ServerFrame};
+use upf::pusher::Pusher;
+use upf::store::Store;
 
 /// Boot the FDB client network exactly once for the whole test binary.
 fn ensure_boot() {
@@ -27,20 +31,28 @@ fn ensure_boot() {
     });
 }
 
-/// Start the server on an ephemeral port; returns its base URL.
+/// Start an all-roles server on an ephemeral port; returns its base URL.
 async fn start_server() -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let base = format!("http://{addr}");
 
-    let config = Config {
+    let config = Arc::new(Config {
         public_url: base.clone(),
+        // Unique node so parallel tests don't share affinity/bells.
+        node_id: format!("test-{}", uuid::Uuid::new_v4()),
+        // Small shard fan-out and a tight safety poll keep the test light and
+        // resilient even if a watch is slow.
+        shard_count: 8,
+        safety_poll_secs: 1,
         ..Config::default()
-    };
+    });
+    let store = Arc::new(Store::connect(config.shard_count).unwrap());
+    let pusher = Some(Pusher::start(store.clone(), config.clone()));
     let state = AppState {
-        storage: Arc::new(Storage::connect().unwrap()),
-        registry: Arc::new(Registry::new()),
-        config: Arc::new(config),
+        store,
+        config: config.clone(),
+        pusher,
     };
     tokio::spawn(async move {
         axum::serve(listener, upf::router(state)).await.unwrap();
@@ -79,16 +91,22 @@ async fn register_deliver_and_replay() {
     // ---- connect, register, capture endpoint --------------------------------
     let (ws, _) = connect_async(&ws_url).await.unwrap();
     let (mut write, mut read) = ws.split();
-    send(&mut write, &ClientFrame::Hello {
-        distributor_id: Some(dist_id.clone()),
-    })
+    send(
+        &mut write,
+        &ClientFrame::Hello {
+            distributor_id: Some(dist_id.clone()),
+        },
+    )
     .await;
     matches_welcome(next_frame(&mut read).await, &dist_id);
 
-    send(&mut write, &ClientFrame::Register {
-        app_id: "app-1".into(),
-        vapid: None,
-    })
+    send(
+        &mut write,
+        &ClientFrame::Register {
+            app_id: "app-1".into(),
+            vapid: None,
+        },
+    )
     .await;
     let (endpoint, endpoint_token) = match next_frame(&mut read).await {
         ServerFrame::Registered {
@@ -99,7 +117,7 @@ async fn register_deliver_and_replay() {
         other => panic!("expected registered, got {other:?}"),
     };
 
-    // ---- online delivery ----------------------------------------------------
+    // ---- online delivery (writer → inbox/bell → pusher drain) ---------------
     let resp = http
         .post(&endpoint)
         .header("TTL", "60")
@@ -122,17 +140,19 @@ async fn register_deliver_and_replay() {
         }
         other => panic!("expected message, got {other:?}"),
     };
-    send(&mut write, &ClientFrame::Ack {
-        endpoint_token: endpoint_token.clone(),
-        msg_id,
-    })
+    send(
+        &mut write,
+        &ClientFrame::Ack {
+            endpoint_token: endpoint_token.clone(),
+            msg_id,
+        },
+    )
     .await;
 
     // ---- offline replay -----------------------------------------------------
-    // Drop the connection, push while offline, reconnect and expect replay.
+    // Drop the connection, push while offline, reconnect + subscribe, expect replay.
     drop(write);
     drop(read);
-    // Give the server a moment to process the ack and the disconnect.
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
     let resp = http.post(&endpoint).body("second").send().await.unwrap();
@@ -140,13 +160,24 @@ async fn register_deliver_and_replay() {
 
     let (ws, _) = connect_async(&ws_url).await.unwrap();
     let (mut write, mut read) = ws.split();
-    send(&mut write, &ClientFrame::Hello {
-        distributor_id: Some(dist_id.clone()),
-    })
+    send(
+        &mut write,
+        &ClientFrame::Hello {
+            distributor_id: Some(dist_id.clone()),
+        },
+    )
     .await;
     matches_welcome(next_frame(&mut read).await, &dist_id);
 
-    // The replayed queue must contain "second" (and only unacked messages).
+    // Re-attach the existing token; drain-on-connect must replay "second".
+    send(
+        &mut write,
+        &ClientFrame::Subscribe {
+            endpoint_token: endpoint_token.clone(),
+        },
+    )
+    .await;
+
     let replayed = match next_frame(&mut read).await {
         ServerFrame::Message { body_b64, .. } => decode(&body_b64),
         other => panic!("expected replayed message, got {other:?}"),
@@ -175,5 +206,7 @@ fn matches_welcome(frame: ServerFrame, expected: &str) {
 }
 
 fn decode(b64: &str) -> Vec<u8> {
-    base64::engine::general_purpose::STANDARD.decode(b64).unwrap()
+    base64::engine::general_purpose::STANDARD
+        .decode(b64)
+        .unwrap()
 }
