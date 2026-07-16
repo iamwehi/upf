@@ -229,6 +229,47 @@ your UnifiedPush distributor. Registrations, the endpoint check, and delivery al
 work. (Point it at a single base URL that serves both publish and subscribe — the
 all-roles process does; see the split-deployment note below.)
 
+### Load testing (`examples/loadgen.rs`)
+
+`loadgen` is a load generator *and* correctness checker: it opens many WebSocket
+subscribers (fake devices) and many concurrent publishers (fake app servers),
+then proves delivery is correct and measures end-to-end latency. Each topic gets
+one publisher sending a strictly increasing sequence number `0,1,2,…` (awaited,
+so commit order = queue-versionstamp order = delivery order) plus a send
+timestamp; every subscriber then asserts it received that stream **in order, with
+no gaps and no duplicates**, and records send→receive latency.
+
+```sh
+# defaults: 1000 topics, 1 sub each, 2000 publishes/sec, for 30s
+scripts/cargo.sh run --release --example loadgen
+
+# knobs are `key=value` args after `--` (env vars are NOT forwarded into the
+# dev container, but args are):
+scripts/cargo.sh run --release --example loadgen -- \
+    topics=2000 subs=1 rate=6000 duration=20
+```
+
+It prints a live per-second line and a final report with throughput, a bounded
+latency histogram (p50/p90/p95/p99/max), and a correctness verdict (loss /
+out-of-order / duplicates / gaps).
+
+Two things to know when reading the output:
+
+- **One subscriber per topic.** This server serves a single subscriber per topic
+  (the UnifiedPush model — a newer subscribe displaces the older locally). Set
+  `subs=1`; a higher value makes the extra connections receive nothing and the
+  run report apparent loss *by design*. Add scale with `topics`, not `subs`.
+- **Overload degrades to latency, not loss.** Past the delivery rate the node can
+  sustain, ingest outruns delivery and a backlog builds in `Q`, so latency climbs
+  — but nothing is dropped: the backlog drains once publishing stops and every
+  message still arrives exactly once, in order. That's the durable-queue design
+  working as intended.
+
+> Correctness results (loss/order/dup) from the single-node **in-memory** FDB in
+> `dev-up.sh` are fully valid. The **throughput/latency numbers are not** capacity
+> figures — a real multi-process `ssd` cluster (and pushers on their own nodes)
+> moves the knee substantially.
+
 ---
 
 ## Running as separate containers (`compose.yaml`)
