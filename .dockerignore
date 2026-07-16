@@ -1,0 +1,7 @@
+# Keep the build context small and reproducible: never ship local build output,
+# the in-container cargo home, or the exported dev cluster file into the image.
+/target
+/.cargo-home
+/.fdb
+/.git
+**/*.rs.bk

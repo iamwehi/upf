@@ -1,0 +1,99 @@
+# Runs UPF as its real deployment shape: FoundationDB plus the three roles as
+# three separate containers, each a copy of the *same* image with a different
+# UPF_ROLES. They never talk to each other directly — only through FDB.
+#
+#   docker compose up --build        # (or: podman compose up --build)
+#
+# Distributors connect to the pusher:   ws://localhost:8081/distributor/ws
+# App servers push to the writer:        http://localhost:8080/push/{token}
+# (the pusher mints endpoint URLs pointing at the writer's published port).
+
+name: upf
+
+# Shared config for the three role containers: one image, one FDB cluster file,
+# one shard count (the writer→pusher poke requires an identical K on both sides).
+x-upf-role: &upf-role
+  image: upf:local
+  build:
+    context: .
+    dockerfile: Containerfile
+  depends_on:
+    fdb-init:
+      condition: service_completed_successfully
+  volumes:
+    - fdb:/var/fdb
+  environment: &upf-env
+    FDB_CLUSTER_FILE: /var/fdb/fdb.cluster
+    UPF_SHARD_COUNT: "64"
+    RUST_LOG: upf=debug,info
+  restart: unless-stopped
+
+services:
+  # ---- FoundationDB (the only stateful infrastructure) --------------------
+  fdb:
+    image: docker.io/foundationdb/foundationdb:7.3.78
+    environment:
+      # Advertise the container's own IP so peers on this network can reach it;
+      # the cluster file (shared via the `fdb` volume) is written accordingly.
+      FDB_NETWORKING_MODE: container
+    volumes:
+      - fdb:/var/fdb
+    restart: unless-stopped
+
+  # One-shot: wait for fdbserver, then create a single-node in-memory database.
+  # Completing successfully is the gate the role containers wait on.
+  fdb-init:
+    image: docker.io/foundationdb/foundationdb:7.3.78
+    depends_on:
+      - fdb
+    volumes:
+      - fdb:/var/fdb
+    environment:
+      FDB_CLUSTER_FILE: /var/fdb/fdb.cluster
+    restart: "no"
+    entrypoint:
+      - bash
+      - -c
+      - |
+        set -e
+        echo "waiting for fdbserver..."
+        for _ in $(seq 1 60); do
+          if fdbcli --exec 'status minimal' >/dev/null 2>&1; then break; fi
+          sleep 1
+        done
+        # Idempotent: harmless error if the database is already configured.
+        fdbcli --exec 'configure new single memory' || true
+        fdbcli --exec 'status minimal'
+        echo "foundationdb ready."
+
+  # ---- Writer: HTTP ingest, POST /push/{token} ----------------------------
+  writer:
+    <<: *upf-role
+    environment:
+      <<: *upf-env
+      UPF_ROLES: writer
+    ports:
+      - "8080:8080" # app servers POST here (matches the minted endpoint URL)
+
+  # ---- Pusher: WebSocket delivery, holds distributor connections ----------
+  pusher:
+    <<: *upf-role
+    environment:
+      <<: *upf-env
+      UPF_ROLES: pusher
+      # Stable identity so affinity/bell ownership survives restarts.
+      UPF_NODE_ID: pusher-1
+      # Endpoints handed to distributors must point at the writer's public port.
+      UPF_PUBLIC_URL: http://localhost:8080
+    ports:
+      - "8081:8080" # distributors connect here (/distributor/ws)
+
+  # ---- Janitor: TTL expiry + dead-node sweeps -----------------------------
+  janitor:
+    <<: *upf-role
+    environment:
+      <<: *upf-env
+      UPF_ROLES: janitor
+
+volumes:
+  fdb:
