@@ -1,0 +1,38 @@
+[package]
+name = "upf"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "upf"
+path = "src/lib.rs"
+
+[[bin]]
+name = "upf"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal", "time"] }
+axum = { version = "0.8", features = ["ws"] }
+foundationdb = { version = "0.11", features = ["fdb-7_3", "embedded-fdb-include"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rand = "0.8"
+base64 = "0.22"
+thiserror = "2"
+anyhow = "1"
+dashmap = "6"
+uuid = { version = "1", features = ["v4"] }
+futures-util = "0.3"
+
+[dev-dependencies]
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect"] }
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+
+# Line-tables-only debuginfo keeps linker memory in check inside the (RAM-limited)
+# dev container while still giving usable backtraces.
+[profile.dev]
+debug = 1
+

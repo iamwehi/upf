@@ -1,0 +1,20 @@
+# Dev/build image for UPF on Apple Silicon (and anywhere without a native
+# FoundationDB client library). FDB ships no macOS arm64 client, so we build and
+# run the Rust binary inside Linux with libfdb_c copied from the matching FDB
+# image — guaranteeing the client lib version matches the server.
+
+FROM docker.io/library/rust:1-bookworm
+
+# foundationdb-sys runs bindgen at build time, which needs libclang.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends clang libclang-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# The FoundationDB C client library, at the exact version of our server.
+COPY --from=docker.io/foundationdb/foundationdb:7.3.78 \
+     /usr/lib/libfdb_c.so /usr/lib/libfdb_c.so
+
+# The app reads the cluster file from here; mounted at runtime.
+ENV FDB_CLUSTER_FILE=/etc/foundationdb/fdb.cluster
+
+WORKDIR /work
