@@ -1,34 +1,31 @@
 //! FoundationDB key layout — the single contract every role shares.
 //!
 //! All keys are tuple-encoded under one root subspace (`"upf"`), so they are
-//! ordered and collision-free. The layout mirrors the design spec:
+//! ordered and collision-free. In the ntfy model a *topic* is the addressing
+//! unit: topics are implicit (no registration record), so there is no `S` map.
 //!
 //! ```text
-//! (S,   token)                     -> Subscription (JSON)      // exists ⇒ registered
-//! (Q,   token, versionstamp)       -> Envelope (JSON)          // durable queue, source of truth
-//! (TI,  token, topic)              -> versionstamp             // RFC 8030 topic collapse
-//! (X,   expiry, token, versionstamp) -> ""                     // TTL index (janitor scans this)
-//! (C,   token)                     -> node_id                  // connection affinity
-//! (IN,  node, shard, versionstamp) -> token                   // per-node inbox (advisory poke)
-//! (SIG, node, shard)               -> counter (LE i64)         // watched bell, one per shard
-//! (L,   node)                      -> heartbeat_secs (LE i64)  // liveness registry
+//! (Q,   topic, versionstamp)         -> Envelope (JSON)          // durable queue, source of truth
+//! (X,   expiry, topic, versionstamp) -> ""                       // TTL index (janitor scans this)
+//! (C,   topic)                       -> node_id                  // subscriber affinity
+//! (IN,  node, shard, versionstamp)   -> topic                    // per-node inbox (advisory poke)
+//! (SIG, node, shard)                 -> counter (LE i64)         // watched bell, one per shard
+//! (L,   node)                        -> heartbeat_secs (LE i64)  // liveness registry
 //! ```
 //!
-//! The message id exposed to devices *is* the queue versionstamp (12 bytes,
-//! base64url-encoded), so an ack round-trips straight back to a `Q` key. Because
-//! all of a writer's versionstamped writes in one transaction share user version
-//! `0`, the `Q`, `X` and `IN` entries for a message carry the *same* stamp.
+//! The message id exposed to subscribers *is* the queue versionstamp (12 bytes,
+//! base64url-encoded), so a `since=<id>` resume decodes straight back to a `Q`
+//! key. All of a writer's versionstamped writes in one transaction share user
+//! version `0`, so the `Q`, `X` and `IN` entries for a message carry one stamp.
 
-use foundationdb::tuple::{Subspace, Versionstamp, pack_with_versionstamp};
+use foundationdb::tuple::{Subspace, Versionstamp};
 
 /// User version reused across every versionstamped write in a single writer
 /// transaction, so `Q`/`X`/`IN` for one message resolve to one identical stamp.
 pub const MSG_USER_VERSION: u16 = 0;
 
 // Short, stable prefix strings for each logical map.
-const S: &str = "S";
 const Q: &str = "Q";
-const TI: &str = "TI";
 const X: &str = "X";
 const C: &str = "C";
 const IN: &str = "IN";
@@ -54,61 +51,38 @@ impl Keyspace {
         }
     }
 
-    // ---- subscriptions (S) --------------------------------------------------
-
-    pub fn subscription(&self, token: &str) -> Vec<u8> {
-        self.root.pack(&(S, token))
-    }
-
     // ---- durable queue (Q) --------------------------------------------------
 
     /// A versionstamped queue key with an *incomplete* stamp, for use with
     /// `SetVersionstampedKey`. FDB fills in the commit version at commit time.
-    pub fn queue_append(&self, token: &str) -> Vec<u8> {
+    pub fn queue_append(&self, topic: &str) -> Vec<u8> {
         self.root
-            .pack_with_versionstamp(&(Q, token, Versionstamp::incomplete(MSG_USER_VERSION)))
+            .pack_with_versionstamp(&(Q, topic, Versionstamp::incomplete(MSG_USER_VERSION)))
     }
 
     /// A concrete queue key for an already-known (complete) versionstamp.
-    pub fn queue_msg(&self, token: &str, vs: &Versionstamp) -> Vec<u8> {
-        self.root.pack(&(Q, token, vs.clone()))
+    pub fn queue_msg(&self, topic: &str, vs: &Versionstamp) -> Vec<u8> {
+        self.root.pack(&(Q, topic, vs.clone()))
     }
 
-    /// `[begin, end)` covering a subscription's whole queue.
-    pub fn queue_range(&self, token: &str) -> (Vec<u8>, Vec<u8>) {
-        self.root.subspace(&(Q, token)).range()
+    /// `[begin, end)` covering a topic's whole queue.
+    pub fn queue_range(&self, topic: &str) -> (Vec<u8>, Vec<u8>) {
+        self.root.subspace(&(Q, topic)).range()
     }
 
     /// Recover the (complete) versionstamp from a queue key.
-    pub fn queue_key_versionstamp(
-        &self,
-        token: &str,
-        key: &[u8],
-    ) -> crate::error::Result<Versionstamp> {
+    pub fn queue_key_versionstamp(&self, key: &[u8]) -> crate::error::Result<Versionstamp> {
         let (_, _, vs) = self.root.unpack::<(String, String, Versionstamp)>(key)?;
-        let _ = token;
         Ok(vs)
-    }
-
-    // ---- topic index (TI) ---------------------------------------------------
-
-    pub fn topic_index(&self, token: &str, topic: &str) -> Vec<u8> {
-        self.root.pack(&(TI, token, topic))
-    }
-
-    /// Value for a topic-index entry: a versionstamp pointing at the current
-    /// message for the topic, written with `SetVersionstampedValue`.
-    pub fn topic_index_value() -> Vec<u8> {
-        pack_with_versionstamp(&(Versionstamp::incomplete(MSG_USER_VERSION),))
     }
 
     // ---- TTL index (X) ------------------------------------------------------
 
-    pub fn ttl_append(&self, expiry_secs: u64, token: &str) -> Vec<u8> {
+    pub fn ttl_append(&self, expiry_secs: u64, topic: &str) -> Vec<u8> {
         self.root.pack_with_versionstamp(&(
             X,
             expiry_secs as i64,
-            token,
+            topic,
             Versionstamp::incomplete(MSG_USER_VERSION),
         ))
     }
@@ -121,23 +95,22 @@ impl Keyspace {
         (begin, end)
     }
 
-    /// Decode a TTL-index key into `(expiry, token, versionstamp)`.
+    /// Decode a TTL-index key into `(expiry, topic, versionstamp)`.
     pub fn ttl_key_parts(&self, key: &[u8]) -> crate::error::Result<(u64, String, Versionstamp)> {
-        let (_, expiry, token, vs) = self
-            .root
-            .unpack::<(String, i64, String, Versionstamp)>(key)?;
-        Ok((expiry.max(0) as u64, token, vs))
+        let (_, expiry, topic, vs) =
+            self.root.unpack::<(String, i64, String, Versionstamp)>(key)?;
+        Ok((expiry.max(0) as u64, topic, vs))
     }
 
     // ---- affinity (C) -------------------------------------------------------
 
-    pub fn affinity(&self, token: &str) -> Vec<u8> {
-        self.root.pack(&(C, token))
+    pub fn affinity(&self, topic: &str) -> Vec<u8> {
+        self.root.pack(&(C, topic))
     }
 
     // ---- inbox (IN) + bell (SIG) --------------------------------------------
 
-    /// Versionstamped inbox key (poke) for `(node, shard)`; value is the token.
+    /// Versionstamped inbox key (poke) for `(node, shard)`; value is the topic.
     pub fn inbox_append(&self, node: &str, shard: u32) -> Vec<u8> {
         self.root.pack_with_versionstamp(&(
             IN,

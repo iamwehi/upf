@@ -1,75 +1,79 @@
-//! JSON control frames exchanged over the distributor WebSocket.
+//! The ntfy subscription wire format (server → subscriber).
 //!
-//! Every frame is a JSON object with a `"type"` discriminator. Client frames
-//! flow distributor → server; server frames flow server → distributor.
-//!
-//! A distributor multiplexes many subscriptions over one socket. Each session it
-//! `subscribe`s the tokens it already holds (re-establishing affinity so pushes
-//! route to this node) and `register`s to obtain new ones. Delivery, affinity and
-//! draining are all *per token* — the "device" of the design spec is really a
-//! `(connection, token)` pair.
+//! We speak ntfy's protocol so real UnifiedPush distributors (the ntfy Android
+//! app, and anything else that subscribes to ntfy) work against UPF unmodified.
+//! Field names and the `encoding` convention mirror ntfy's `model.Message`.
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::MessageHeaders;
+use crate::model::Envelope;
 
-/// Frames sent by the distributor to the server.
+pub const EVENT_OPEN: &str = "open";
+pub const EVENT_KEEPALIVE: &str = "keepalive";
+pub const EVENT_MESSAGE: &str = "message";
+
+/// One line/frame delivered to a subscriber. Matches ntfy's JSON message object;
+/// `open` and `keepalive` are control frames carrying no body.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ClientFrame {
-    /// First frame on a connection: identifies the distributor. If no
-    /// `distributor_id` is supplied the server mints one and returns it. The id
-    /// is informational (for logs); routing is per-token, not per-distributor.
-    Hello {
-        #[serde(default)]
-        distributor_id: Option<String>,
-    },
-    /// Register a new application instance; the server mints an endpoint token
-    /// and immediately attaches it to this connection.
-    Register {
-        app_id: String,
-        #[serde(default)]
-        vapid: Option<String>,
-    },
-    /// Attach an already-registered token to this connection: claim affinity and
-    /// replay any queued messages. Sent for every persisted token on reconnect.
-    Subscribe { endpoint_token: String },
-    /// Remove a subscription by its endpoint token.
-    Unregister { endpoint_token: String },
-    /// Acknowledge receipt of a delivered message so it can be dropped from `Q`.
-    Ack {
-        endpoint_token: String,
-        msg_id: String,
-    },
-    /// Liveness check.
-    Ping,
+pub struct NtfyMessage {
+    pub id: String,
+    pub time: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires: Option<i64>,
+    pub event: String,
+    pub topic: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<u8>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    /// `""` (omitted) for UTF-8, `"base64"` for a binary `message`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub encoding: String,
 }
 
-/// Frames sent by the server to the distributor.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ServerFrame {
-    /// Response to `hello`, echoing the (possibly newly minted) distributor id.
-    Welcome { distributor_id: String },
-    /// Response to `register`: the public endpoint URL and its token (now attached).
-    Registered {
-        app_id: String,
-        endpoint: String,
-        endpoint_token: String,
-    },
-    /// Response to `subscribe`: the token is now bound to this connection.
-    Subscribed { endpoint_token: String },
-    /// Response to `unregister`.
-    Unregistered { endpoint_token: String },
-    /// A forwarded push message. `body_b64` is the raw (encrypted) WebPush body.
-    Message {
-        endpoint_token: String,
-        msg_id: String,
-        body_b64: String,
-        headers: MessageHeaders,
-    },
-    /// Response to `ping`.
-    Pong,
-    /// An error the distributor should surface/log; non-fatal to the connection.
-    Error { reason: String },
+impl NtfyMessage {
+    /// The `open` control frame, sent once when a subscription is established.
+    pub fn open(topic: &str, id: String, time: i64) -> Self {
+        Self::control(EVENT_OPEN, topic, id, time)
+    }
+
+    /// A `keepalive` control frame, sent periodically to hold the connection.
+    pub fn keepalive(topic: &str, id: String, time: i64) -> Self {
+        Self::control(EVENT_KEEPALIVE, topic, id, time)
+    }
+
+    fn control(event: &str, topic: &str, id: String, time: i64) -> Self {
+        Self {
+            id,
+            time,
+            expires: None,
+            event: event.to_string(),
+            topic: topic.to_string(),
+            message: None,
+            title: None,
+            priority: None,
+            tags: Vec::new(),
+            encoding: String::new(),
+        }
+    }
+
+    /// A `message` frame carrying a queued envelope.
+    pub fn message(topic: &str, id: String, env: &Envelope) -> Self {
+        Self {
+            id,
+            time: env.received_at_secs as i64,
+            expires: Some(env.expiry_secs as i64),
+            event: EVENT_MESSAGE.to_string(),
+            topic: topic.to_string(),
+            message: Some(env.message.clone()),
+            title: env.title.clone(),
+            priority: env.priority,
+            tags: env.tags.clone(),
+            encoding: env.encoding.clone(),
+        }
+    }
 }

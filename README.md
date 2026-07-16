@@ -1,4 +1,4 @@
-# UPF — a scalable UnifiedPush push server on FoundationDB
+# UPF — a scalable, ntfy-compatible UnifiedPush server on FoundationDB
 
 UPF is a [UnifiedPush](https://unifiedpush.org/) push server written in Rust. It
 scales horizontally by keeping **all state and all coordination in FoundationDB**
@@ -6,10 +6,14 @@ scales horizontally by keeping **all state and all coordination in FoundationDB*
 role reads and writes the same keyspace; FDB is simultaneously the database, the
 queue, and the message bus.
 
+It speaks **[ntfy](https://ntfy.sh)'s protocol**, so real UnifiedPush
+distributors — notably the ntfy Android app, one of the most widely installed —
+work against it unmodified. You can point a real phone at UPF to test it.
+
 ```
-app servers ──POST──▶ [LB] ──▶ writer × W ──txn──▶ ┌─────┐
-                                                    │ FDB │ ◀─watch/drain─ pusher × P ◀─WS─ distributors
-                             janitor × 1 ──txn────▶ └─────┘
+app servers ──POST /{topic}──▶ [LB] ──▶ writer × W ──txn──▶ ┌─────┐
+                                                            │ FDB │ ◀─watch/drain─ pusher × P ◀─ntfy ws/json/sse─ distributors
+                                     janitor × 1 ──txn────▶ └─────┘
 ```
 
 ---
@@ -20,12 +24,13 @@ UnifiedPush splits the world in two, and only one half is standardized:
 
 | Link | Spec | This server |
 | --- | --- | --- |
-| **App server → push server** | WebPush — [RFC 8030](https://www.rfc-editor.org/rfc/rfc8030) (HTTP delivery), [8291](https://www.rfc-editor.org/rfc/rfc8291) (encryption), [8292](https://www.rfc-editor.org/rfc/rfc8292) (VAPID) | `POST /push/{token}` |
-| **Push server → distributor** | *deliberately unspecified* | our **WebSocket** protocol |
+| **App server → push server** | WebPush — [RFC 8030](https://www.rfc-editor.org/rfc/rfc8030)/[8291](https://www.rfc-editor.org/rfc/rfc8291)/[8292](https://www.rfc-editor.org/rfc/rfc8292) | ntfy-style `POST /{topic}?up=1` |
+| **Push server → distributor** | *deliberately unspecified* | **ntfy's protocol** (`/{topic}/ws`,`/json`,`/sse`) |
 
-The push body is opaque, end-to-end-encrypted bytes (RFC 8291); UPF stores and
-forwards it verbatim and never decrypts it. Endpoint tokens carry ≥160 bits of
-entropy and are URL-safe (UnifiedPush requirement).
+We adopt ntfy's protocol on **both** halves so the whole ecosystem — app servers
+*and* distributors — interoperates. The push body is opaque, end-to-end-encrypted
+bytes (RFC 8291); UPF stores and forwards it verbatim and never decrypts it.
+Binary bodies are base64-encoded on the wire exactly as ntfy does it.
 
 ---
 
@@ -35,82 +40,79 @@ A role is a deployable. One binary runs any subset (`UPF_ROLES`); by default it
 runs all three in-process — but they *still* only talk through FDB, so the
 single-process build and a sharded fleet exercise identical code paths.
 
-- **Writer** — stateless HTTP ingest. Handles `POST /push/{token}`, runs one FDB
-  transaction, returns `201`. Scales with push rate behind an L4 load balancer.
-- **Pusher** — stateful WebSocket delivery. Holds distributor connections,
-  watches shard "bells", drains durable queues. Scales with connection count;
-  every node is identical.
+- **Writer** — stateless HTTP ingest. Handles `POST`/`PUT /{topic}`, runs one FDB
+  transaction, returns the message JSON. Scales with push rate behind an L4 LB.
+- **Pusher** — stateful subscription delivery. Holds `/{topic}/ws|json|sse`
+  connections, watches shard "bells", streams durable queues. Scales with
+  connection count; every node is identical.
 - **Janitor** — background worker. Expires TTL'd messages and sweeps records left
   by dead nodes. One instance is plenty for a long time.
 
 ---
 
-## Key concepts introduced by this design
-
-If you already knew the walking-skeleton version (an in-process registry mapping
-distributor → socket), these are what changed and why.
+## Key concepts
 
 ### 1. FDB-only coordination — no bus, no RPC
 
 A writer never calls a pusher. When a message arrives it lands in FoundationDB,
 and the pusher holding the relevant connection *finds out through FoundationDB*.
-This is what lets writers and pushers scale on independent axes and lets any node
-die without a failover protocol: state was never in a process.
+This lets writers and pushers scale on independent axes and lets any node die
+without a failover protocol: state was never in a process.
 
-### 2. `Q` is the only source of truth
+### 2. `Q` is the only source of truth; delivery is offset-based
 
-Every push is appended to a durable per-token queue `Q` **before** anything else
-happens. Everything else in the keyspace — bells, inboxes, the TTL index — is
-*advisory*. Losing any of it costs latency, never a message. A message is not
-considered delivered until the distributor **acks** it and it is cleared from `Q`.
-Delivery is therefore **at-least-once**; a distributor should dedupe by `msg_id`.
+Every publish is appended to a durable per-topic queue `Q` **before** anything
+else. Everything else in the keyspace — bells, inboxes, the TTL index — is
+*advisory*; losing it costs latency, never a message.
 
-### 3. Versionstamps as message identity
+ntfy has **no per-message ack**: a subscriber tracks an offset and resumes with
+`since=<id>`. That maps perfectly onto `Q` (see §3), so UPF is **cursor-based**,
+not ack-based — nothing is cleared on send. Each connection remembers the last
+versionstamp it was sent and only receives newer ones. Messages persist until
+their TTL; the **janitor** reclaims them. A client that reconnects with
+`since=<last-id>` gets exactly what it missed.
+
+### 3. Versionstamps as message identity *and* offset
 
 Queue entries are keyed by an FDB **versionstamp** — a 12-byte value FDB assigns
-at commit time that is globally ordered by commit sequence. This gives us, for
-free:
+at commit time, globally ordered by commit sequence. This gives us, for free:
 
-- **FIFO ordering** without trusting any clock (versionstamps are assigned by the
-  cluster, not the writer).
-- **A stable message id.** The versionstamp *is* the `msg_id` we hand the
-  distributor (base64url-encoded). When the distributor acks it, we decode it
-  straight back into the `Q` key and clear it.
+- **FIFO ordering** without trusting any clock (the cluster assigns it).
+- **A resumable id.** The versionstamp *is* the ntfy message `id` (base64url).
+  `since=<id>` decodes straight back into a `Q` key, so resuming a subscription
+  is a range scan "everything after this key" — exactly ntfy's `since` semantics.
 - **Consistency across indexes.** All of a writer's versionstamped writes in one
   transaction share user-version `0`, so the `Q` entry, its TTL-index (`X`) entry,
-  and the inbox poke all carry the *same* stamp — one message, one id.
+  and the inbox poke carry the *same* stamp — one message, one id.
 
 ### 4. Affinity — routing that lives in the database
 
-`(C, token) → node_id` records which pusher node currently holds a token's
-connection. A writer reads it to decide whom to poke. It is **soft state**: a
-stale affinity just means a poke goes to the wrong (or a dead) node — the message
-is safe in `Q` and gets picked up on the next connect or safety poll. Affinity is
+`(C, topic) → node_id` records which pusher node currently holds a topic's
+subscriber. A writer reads it to decide whom to poke. It is **soft state**: a
+stale affinity just sends a poke to the wrong (or a dead) node — the message is
+safe in `Q` and is picked up on the next connect or safety poll. Affinity is
 never verified and pokes are never retried.
 
 ### 5. Bells + inboxes — an O(K) wakeup mechanism
 
 The naïve way to wake a pusher is one FDB `watch` per connection — but watches are
-capped (~10k/connection) and that ties your connection density to your watch
-budget. Instead:
+capped (~10k/connection), tying connection density to your watch budget. Instead:
 
-- Each node has **K shards** (default 64). A token maps to a shard by a stable
-  hash (`shard = fnv1a(token) % K`).
+- Each node has **K shards** (default 64). A topic maps to a shard by a stable
+  hash (`shard = fnv1a(topic) % K`).
 - A node opens exactly **K watches** — one per `(SIG, node, shard)` **bell** —
   *regardless of how many connections it holds*. Watch budget is O(K), not
   O(connections).
-- To poke, a writer appends the token to that node's **inbox**
-  `(IN, node, shard, versionstamp) → token` and bumps the bell counter. The
-  bell's change wakes the node's watch; it reads the inbox, and for each token it
-  actually holds, drains that token's `Q`.
+- To poke, a writer appends the topic to that node's **inbox**
+  `(IN, node, shard, versionstamp) → topic` and bumps the bell counter. The
+  bell's change wakes the node's watch; it reads the inbox and, for each topic it
+  holds, streams new `Q` entries from that subscriber's cursor.
 
 ### 6. Three rules that make it correct
 
-The whole system's correctness reduces to three invariants:
-
 1. **`Q` is the only source of truth** — bells/inboxes are advisory.
-2. **Every connect full-drains `Q`** (drain-on-connect) — this one rule absorbs
-   node death, connection migration, and missed watches.
+2. **Every connect drains `Q` from the requested offset** — this absorbs node
+   death, connection migration, and missed watches.
 3. **A periodic safety poll** re-drains every live connection regardless of bells
    — so a lost watch or a stale affinity is a *latency* bug, never a *loss* bug.
 
@@ -118,58 +120,76 @@ The whole system's correctness reduces to three invariants:
 
 ## FoundationDB keyspace
 
-All keys are tuple-encoded under one root subspace (`"upf"`).
+All keys are tuple-encoded under one root subspace (`"upf"`). Topics are implicit
+(ntfy semantics) — there is no registration record.
 
 ```
-(S,   token)                       -> Subscription (JSON)       exists ⇒ registered
-(Q,   token, versionstamp)         -> Envelope (JSON)           durable queue — source of truth
-(TI,  token, topic)                -> versionstamp              RFC 8030 topic collapse
-(X,   expiry, token, versionstamp) -> ""                        TTL index (janitor scans this)
-(C,   token)                       -> node_id                   connection affinity (soft)
-(IN,  node, shard, versionstamp)   -> token                     per-node inbox (advisory poke)
+(Q,   topic, versionstamp)         -> Envelope (JSON)           durable queue — source of truth
+(X,   expiry, topic, versionstamp) -> ""                        TTL index (janitor scans this)
+(C,   topic)                       -> node_id                   subscriber affinity (soft)
+(IN,  node, shard, versionstamp)   -> topic                     per-node inbox (advisory poke)
 (SIG, node, shard)                 -> counter (LE i64)          watched bell, one per shard
 (L,   node)                        -> heartbeat_secs (LE i64)   liveness registry
 ```
 
 ## Algorithms (one transaction each)
 
-**Writer** (`POST /push/{token}`): verify `S` exists → append `Q` → if `Topic`,
-clear the previous topic message and repoint `TI` → write `X` → read affinity
-`C`; if present, append to that node's `IN` and ring its `SIG`. Commit. A missing
-affinity just means the device is offline; the message waits in `Q`.
+**Writer** (`POST /{topic}`): append `Q` → write `X` → read affinity `C`; if
+present, append to that node's `IN` and ring its `SIG`. Commit. No topic
+existence check (topics are implicit); a missing affinity just means nobody is
+subscribed, and the message waits in `Q`.
 
 **Pusher**:
 - *Boot*: open K watches, one per `(SIG, self, shard)`.
-- *On connect (`subscribe`/`register`)*: authenticate against `S`, write
-  `(C, token) → self`, register the socket locally, **full-drain `Q`**.
-- *On bell fire*: re-arm the watch immediately, read+clear the inbox, drain `Q`
-  for each held token.
-- *Safety poll* (~every `UPF_SAFETY_POLL_SECS`): drain every held connection.
+- *On subscribe*: resolve the `since` offset, write `(C, topic) → self`, register
+  the socket locally with that cursor, emit `open`, then stream from the cursor.
+- *On bell fire*: re-arm the watch immediately, read+clear the inbox, stream new
+  `Q` entries for each held topic (advancing its cursor).
+- *Safety poll* (~every `UPF_SAFETY_POLL_SECS`): re-drain every held connection.
 - *On disconnect*: compare-and-clear affinity (only if it still equals self).
 
 **Janitor**: scan `(X, 0..now)` in bounded batches, clearing each due `Q` message
-and its `X` entry; then clear inbox/bell/liveness records for nodes that stopped
-heartbeating.
+and its `X` entry; then clear inbox/bell/liveness records for dead nodes.
 
 ---
 
-## Distributor WebSocket protocol
+## The ntfy protocol UPF speaks
 
-JSON frames, each tagged with a `"type"`. A distributor multiplexes many
-subscriptions over one socket. Each session it `subscribe`s the tokens it already
-holds (re-establishing affinity) and `register`s to obtain new ones.
+### Publish (app server → UPF)
 
-| Client → server | Server → client |
-| --- | --- |
-| `hello {distributor_id?}` | `welcome {distributor_id}` |
-| `register {app_id, vapid?}` | `registered {app_id, endpoint, endpoint_token}` |
-| `subscribe {endpoint_token}` | `subscribed {endpoint_token}` |
-| `unregister {endpoint_token}` | `unregistered {endpoint_token}` |
-| `ack {endpoint_token, msg_id}` | `message {endpoint_token, msg_id, body_b64, headers}` |
-| `ping` | `pong` / `error {reason}` |
+```
+POST /{topic}?up=1        # or PUT; ?unifiedpush=1, X-UnifiedPush: 1, or
+                          # Content-Encoding: aes128gcm also enable UnifiedPush mode
+```
 
-The "device" in the delivery algorithm is really a `(connection, token)` pair:
-affinity, inbox, and draining are all per **token**, not per distributor.
+The request body is the message, verbatim. UTF-8 bodies pass through as text;
+binary bodies become `"message": "<base64>"` with `"encoding": "base64"`. Response
+is `200` with the ntfy message JSON. Max body 4096 bytes (`413` if exceeded);
+invalid topic names give `400`.
+
+`GET /{topic}?up=1` is the UnifiedPush endpoint check and returns
+`{"unifiedpush":{"version":1}}`.
+
+### Subscribe (distributor → UPF)
+
+```
+GET /{topic}/ws          # WebSocket (ntfy's default), JSON frames
+GET /{topic}/json        # newline-delimited JSON stream
+GET /{topic}/sse         # Server-Sent Events
+```
+
+Query parameters: `since=` (`all`, a message `id`, a unix timestamp, or a duration
+like `10m`/`1h`/`1d`) resumes from an offset; `poll=1` returns the cached messages
+and closes. The server sends an `open` frame, periodic `keepalive` frames, and
+`message` frames. Each frame is an ntfy message object:
+
+```json
+{"id":"AAAAAcXoizIAAAAA","time":1784214948,"event":"message",
+ "topic":"upDEMO0001","message":"hello","encoding":""}
+```
+
+Because topics are implicit and ids are offsets, reliable delivery is: subscribe,
+remember the last `id`, and on reconnect pass `since=<id>`.
 
 ---
 
@@ -184,52 +204,63 @@ scripts/dev-up.sh          # start FDB in a pod, init the DB, build the dev imag
 scripts/cargo.sh build     # build inside the dev container
 scripts/cargo.sh test      # unit + e2e tests against the live FDB
 scripts/cargo.sh run       # run all roles on the pod's :8080
-scripts/dev-down.sh         # tear the pod down
+scripts/dev-down.sh        # tear the pod down
 ```
 
-Manual smoke test:
+Manual smoke test with `curl` (talk to the all-roles server on `:8080`):
 
 ```sh
-# terminal A — run the server
-scripts/cargo.sh run
-
-# terminal B — a mock distributor: registers, prints its endpoint, auto-acks
-scripts/cargo.sh run --example mock_distributor
-
-# terminal C — push to the printed endpoint
-curl -X POST --data 'hi there' <endpoint>
+T=upDEMO0001
+# subscribe (prints open + messages); or use the bundled mock:
+#   UPF_TOPIC=$T cargo run --example mock_distributor
+curl -N "http://localhost:8080/$T/json" &
+# publish (UnifiedPush raw mode):
+curl -X POST --data 'hi there' "http://localhost:8080/$T?up=1"
+# offline replay: publish with nobody listening, then resume from the start:
+curl -X POST --data 'while offline' "http://localhost:8080/$T?up=1"
+curl "http://localhost:8080/$T/json?since=all&poll=1"
 ```
 
-Kill the mock distributor, `curl` again while it's offline, then restart it with
-`UPF_SUB_TOKEN=<token>` — the queued message replays on reconnect, proving `Q`
-durability.
+### With the real ntfy Android app
+
+Because UPF speaks ntfy, you can test against a real device: in the ntfy app,
+**Settings → set the server URL** to your all-roles UPF instance, then use it as
+your UnifiedPush distributor. Registrations, the endpoint check, and delivery all
+work. (Point it at a single base URL that serves both publish and subscribe — the
+all-roles process does; see the split-deployment note below.)
 
 ---
 
 ## Running as separate containers (`compose.yaml`)
 
 `scripts/cargo.sh run` is a single all-roles process. `compose.yaml` runs the
-real deployment shape instead: FoundationDB plus **writer, pusher and janitor as
-three separate containers** — each the *same* image (`Containerfile`) with a
-different `UPF_ROLES`. They share nothing but the database.
+real deployment shape: FoundationDB plus **writer, pusher and janitor as three
+separate containers** — each the *same* image (`Containerfile`) with a different
+`UPF_ROLES`. They share nothing but the database.
 
 ```sh
 docker compose up --build      # or: podman compose up --build
 ```
 
-- **writer** — published on `localhost:8080`; app servers `POST` here.
-- **pusher** — published on `localhost:8081`; distributors connect to
-  `ws://localhost:8081/distributor/ws`. It mints endpoint URLs pointing at the
-  writer's public port (`UPF_PUBLIC_URL=http://localhost:8080`).
+- **writer** — published on `localhost:8080`; app servers `POST /{topic}` here.
+- **pusher** — published on `localhost:8081`; distributors subscribe at
+  `/{topic}/ws`.
 - **janitor** — no ports; runs TTL expiry + sweeps.
 - **fdb** + **fdb-init** — the database and a one-shot that configures it; the
   role containers wait on `fdb-init` completing.
 
-Two invariants the file encodes: writer and pusher share an identical
+Invariants the file encodes: writer and pusher share an identical
 `UPF_SHARD_COUNT` (the poke addresses a shard both sides must agree on), and the
-pusher has a stable `UPF_NODE_ID` so its affinity/bell ownership survives
-restarts. Scale a role with `docker compose up --scale pusher=3` — because
-coordination is entirely in FDB, added pushers are immediately live.
+pusher has a stable `UPF_NODE_ID` so affinity/bell ownership survives restarts.
+Scale a role with `docker compose up --scale pusher=3` — because coordination is
+entirely in FDB, added pushers are immediately live.
+
+> **Single base URL.** ntfy uses one origin for both publish and subscribe, so a
+> distributor configured with base URL `X` will publish endpoints of the form
+> `X/{topic}` *and* subscribe at `X/{topic}/ws`. In the split deployment, put an
+> ingress in front that routes `/{topic}/ws|json|sse` → pusher and everything else
+> → writer. The all-roles process already serves both, which is why it's the
+> simplest target for a real distributor.
 
 ---
 
@@ -238,15 +269,16 @@ coordination is entirely in FDB, added pushers are immediately live.
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `UPF_BIND` | `0.0.0.0:8080` | HTTP/WS listen address |
-| `UPF_PUBLIC_URL` | `http://localhost:8080` | base URL used to build endpoints |
 | `UPF_ROLES` | `writer,pusher,janitor` | roles this process runs |
 | `UPF_NODE_ID` | random | this node's identity (affinity/inbox/bell owner) |
 | `UPF_SHARD_COUNT` | `64` | inbox shards per node (`K`); must match fleet-wide |
-| `UPF_MAX_MESSAGE_BYTES` | `4096` | max WebPush body (UnifiedPush limit) |
-| `UPF_DEFAULT_TTL_SECS` | `2419200` (4w) | message lifetime when no `TTL` header |
+| `UPF_MAX_MESSAGE_BYTES` | `4096` | max message body (ntfy/UnifiedPush limit) |
+| `UPF_DEFAULT_TTL_SECS` | `2419200` (4w) | message retention / cache window |
 | `UPF_SAFETY_POLL_SECS` | `60` | how often pushers re-drain live connections |
+| `UPF_KEEPALIVE_SECS` | `45` | interval between `keepalive` frames |
 | `UPF_HEARTBEAT_SECS` | `10` | pusher liveness heartbeat interval |
 | `UPF_JANITOR_INTERVAL_SECS` | `30` | janitor pass interval |
+| `UPF_PUBLIC_URL` | `http://localhost:8080` | informational (logged) |
 | `FDB_CLUSTER_FILE` | system default | FoundationDB cluster file |
 
 ---
@@ -256,15 +288,15 @@ coordination is entirely in FDB, added pushers are immediately live.
 Writers scale with push rate; pushers scale with concurrent connections (a tuned
 node holds 100k+); FDB scales commit throughput via proxies/logs and read
 throughput via storage servers. All pushers are identical — add nodes to add
-capacity. Multi-region: one cluster per region, region-prefixed into the token,
+capacity. Multi-region: one cluster per region, region-prefixed into the topic,
 routed by prefix.
 
 ## Roadmap
 
 Deliberately deferred (the delivery core above is complete and tested):
 
-- VAPID (RFC 8292) verification — the `S` record already carries the public key.
-- RFC 8030 `Urgency`, richer `Topic`/receipt semantics.
-- Rate limiting (`429`).
-- Distributor authentication hardening.
+- Topic access control / auth (ntfy tokens); today topics are open.
+- Rate limiting (`429`) — including ntfy's subscribe-before-publish rule.
+- Message attachments and the richer ntfy publish features (title/priority/tags
+  are forwarded; attachments, actions, and scheduling are not).
 - Metrics / OpenTelemetry.

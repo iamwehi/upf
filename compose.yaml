@@ -4,9 +4,15 @@
 #
 #   docker compose up --build        # (or: podman compose up --build)
 #
-# Distributors connect to the pusher:   ws://localhost:8081/distributor/ws
-# App servers push to the writer:        http://localhost:8080/push/{token}
-# (the pusher mints endpoint URLs pointing at the writer's published port).
+# UPF speaks ntfy's protocol:
+#   Distributors subscribe on the pusher:  ws://localhost:8081/{topic}/ws
+#   App servers publish to the writer:      http://localhost:8080/{topic}?up=1
+#
+# NOTE: ntfy uses one base URL for both publish and subscribe. A real distributor
+# configured with base URL X publishes to X/{topic} AND subscribes at X/{topic}/ws,
+# so a split deployment needs an ingress routing /{topic}/ws|json|sse -> pusher and
+# everything else -> writer. The single all-roles process (scripts/cargo.sh run)
+# serves both at one URL and is the simplest target for a real distributor.
 
 name: upf
 
@@ -66,16 +72,16 @@ services:
         fdbcli --exec 'status minimal'
         echo "foundationdb ready."
 
-  # ---- Writer: HTTP ingest, POST /push/{token} ----------------------------
+  # ---- Writer: ntfy publish surface, POST/PUT /{topic} --------------------
   writer:
     <<: *upf-role
     environment:
       <<: *upf-env
       UPF_ROLES: writer
     ports:
-      - "8080:8080" # app servers POST here (matches the minted endpoint URL)
+      - "8080:8080" # app servers publish here (POST /{topic}?up=1)
 
-  # ---- Pusher: WebSocket delivery, holds distributor connections ----------
+  # ---- Pusher: ntfy subscription delivery (/{topic}/ws|json|sse) ----------
   pusher:
     <<: *upf-role
     environment:
@@ -83,10 +89,8 @@ services:
       UPF_ROLES: pusher
       # Stable identity so affinity/bell ownership survives restarts.
       UPF_NODE_ID: pusher-1
-      # Endpoints handed to distributors must point at the writer's public port.
-      UPF_PUBLIC_URL: http://localhost:8080
     ports:
-      - "8081:8080" # distributors connect here (/distributor/ws)
+      - "8081:8080" # distributors subscribe here (/{topic}/ws)
 
   # ---- Janitor: TTL expiry + dead-node sweeps -----------------------------
   janitor:

@@ -1,31 +1,37 @@
-//! Per-node in-memory index of live token connections.
+//! Per-node in-memory index of live topic subscriptions.
 //!
-//! This is *not* a routing table — routing lives in FDB affinity (`C`). It is
-//! only the local map from a token to the socket that currently holds it on this
-//! node, so a bell fire or safety poll can find the writer channel to deliver on.
-//! Losing this map costs nothing durable: the messages are all still in `Q`.
+//! Not a routing table — routing lives in FDB affinity (`C`). This is only the
+//! map from a topic to the subscriber socket currently serving it on this node,
+//! plus that subscriber's **offset cursor** (the last queue versionstamp it has
+//! been sent). Losing this map costs nothing durable: everything is still in `Q`,
+//! and a reconnecting client resumes by `since=<id>`.
+//!
+//! One connection per topic (new subscribe displaces the old): UnifiedPush uses
+//! one distributor per topic, so we don't fan a topic out to many local sockets.
 
 use std::sync::Arc;
 
 use dashmap::DashMap;
+use foundationdb::tuple::Versionstamp;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::protocol::ServerFrame;
+use crate::protocol::NtfyMessage;
 
-/// A token's live connection on this node.
-pub struct TokenConn {
-    /// Feeds the connection's WebSocket writer task.
-    pub tx: UnboundedSender<ServerFrame>,
-    /// Serializes drains for this token so a bell fire and the safety poll don't
-    /// interleave two concurrent replays of the same queue.
-    pub drain_lock: Mutex<()>,
+/// A topic's live subscriber on this node.
+pub struct TopicConn {
+    /// Feeds the subscriber's transport (ws/json/sse writer).
+    pub tx: UnboundedSender<NtfyMessage>,
+    /// The offset already delivered to this subscriber. `None` means "from the
+    /// start of the queue"; drains advance it as messages are sent. Held under a
+    /// mutex so a bell fire and the safety poll can't double-deliver.
+    pub cursor: Mutex<Option<Versionstamp>>,
 }
 
-/// Maps `endpoint_token` → the connection currently serving it on this node.
+/// Maps `topic` → the subscriber currently serving it on this node.
 #[derive(Default)]
 pub struct Local {
-    conns: DashMap<String, Arc<TokenConn>>,
+    conns: DashMap<String, Arc<TopicConn>>,
 }
 
 impl Local {
@@ -33,30 +39,35 @@ impl Local {
         Self::default()
     }
 
-    /// Bind a token to a connection, displacing any previous local binding.
-    pub fn attach(&self, token: String, tx: UnboundedSender<ServerFrame>) -> Arc<TokenConn> {
-        let conn = Arc::new(TokenConn {
+    /// Bind a topic to a subscriber with an initial cursor, displacing any prior
+    /// local binding for that topic.
+    pub fn attach(
+        &self,
+        topic: String,
+        tx: UnboundedSender<NtfyMessage>,
+        cursor: Option<Versionstamp>,
+    ) -> Arc<TopicConn> {
+        let conn = Arc::new(TopicConn {
             tx,
-            drain_lock: Mutex::new(()),
+            cursor: Mutex::new(cursor),
         });
-        self.conns.insert(token, conn.clone());
+        self.conns.insert(topic, conn.clone());
         conn
     }
 
-    /// Remove a token's binding, but only if it still points at `tx` (avoids a
-    /// disconnecting connection tearing down a token another connection re-took).
-    pub fn detach_if(&self, token: &str, tx: &UnboundedSender<ServerFrame>) {
+    /// Remove a topic's binding, but only if it still points at `tx`.
+    pub fn detach_if(&self, topic: &str, tx: &UnboundedSender<NtfyMessage>) {
         self.conns
-            .remove_if(token, |_, existing| existing.tx.same_channel(tx));
+            .remove_if(topic, |_, existing| existing.tx.same_channel(tx));
     }
 
-    /// The connection currently serving a token on this node, if any.
-    pub fn get(&self, token: &str) -> Option<Arc<TokenConn>> {
-        self.conns.get(token).map(|e| e.clone())
+    /// The subscriber currently serving a topic on this node, if any.
+    pub fn get(&self, topic: &str) -> Option<Arc<TopicConn>> {
+        self.conns.get(topic).map(|e| e.clone())
     }
 
-    /// Snapshot of every token currently held on this node (for the safety poll).
-    pub fn tokens(&self) -> Vec<String> {
+    /// Snapshot of every topic currently held on this node (for the safety poll).
+    pub fn topics(&self) -> Vec<String> {
         self.conns.iter().map(|e| e.key().clone()).collect()
     }
 }

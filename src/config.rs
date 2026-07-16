@@ -62,6 +62,8 @@ pub struct Config {
     /// How often each pusher re-drains every live connection regardless of bells.
     /// This backstop turns lost watches / stale affinity into latency, not loss.
     pub safety_poll_secs: u64,
+    /// How often a subscriber connection is sent an ntfy `keepalive` frame.
+    pub keepalive_secs: u64,
     /// How often a pusher refreshes its liveness heartbeat (`L`).
     pub heartbeat_secs: u64,
     /// How often the janitor runs its expiry + sweep pass.
@@ -79,6 +81,7 @@ impl Default for Config {
             shard_count: 64,
             default_ttl_secs: 4 * 7 * 24 * 60 * 60, // 4 weeks
             safety_poll_secs: 60,
+            keepalive_secs: 45, // ntfy's default
             heartbeat_secs: 10,
             janitor_interval_secs: 30,
         }
@@ -120,6 +123,9 @@ impl Config {
         if let Ok(n) = env_parse("UPF_SAFETY_POLL_SECS") {
             cfg.safety_poll_secs = n;
         }
+        if let Ok(n) = env_parse("UPF_KEEPALIVE_SECS") {
+            cfg.keepalive_secs = n;
+        }
         if let Ok(n) = env_parse("UPF_HEARTBEAT_SECS") {
             cfg.heartbeat_secs = n;
         }
@@ -127,11 +133,6 @@ impl Config {
             cfg.janitor_interval_secs = n;
         }
         cfg
-    }
-
-    /// Build the public endpoint URL for a subscription token.
-    pub fn endpoint_for(&self, token: &str) -> String {
-        format!("{}/push/{}", self.public_url, token)
     }
 
     pub fn has_role(&self, role: Role) -> bool {

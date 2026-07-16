@@ -13,19 +13,19 @@
 pub mod config;
 pub mod error;
 pub mod hash;
+pub mod ids;
 pub mod janitor;
 pub mod keyspace;
 pub mod model;
 pub mod protocol;
 pub mod pusher;
 pub mod store;
-pub mod token;
 pub mod writer;
 
 use std::sync::Arc;
 
 use axum::Router;
-use axum::routing::{get, post};
+use axum::routing::get;
 
 use crate::config::{Config, Role};
 use crate::pusher::Pusher;
@@ -43,13 +43,26 @@ pub struct AppState {
 }
 
 /// Build the axum router, mounting only the routes for this process's roles.
+///
+/// The surface is ntfy-compatible: publish to `/{topic}` (writer), subscribe on
+/// `/{topic}/ws|json|sse` (pusher). Running both roles in one process serves the
+/// whole ntfy surface at one base URL — the simplest target for a real
+/// distributor. In a split deployment a single ingress must front both roles.
 pub fn router(state: AppState) -> Router {
     let mut router = Router::new().route("/healthz", get(healthz));
     if state.config.has_role(Role::Writer) {
-        router = router.route("/push/{token}", post(writer::push));
+        router = router.route(
+            "/{topic}",
+            get(writer::topic_get)
+                .post(writer::publish)
+                .put(writer::publish),
+        );
     }
     if state.config.has_role(Role::Pusher) {
-        router = router.route("/distributor/ws", get(pusher::ws::handler));
+        router = router
+            .route("/{topic}/ws", get(pusher::ws::ws))
+            .route("/{topic}/json", get(pusher::ws::json))
+            .route("/{topic}/sse", get(pusher::ws::sse));
     }
     router.with_state(state)
 }
