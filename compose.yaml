@@ -1,23 +1,22 @@
-# Runs UPF as its real deployment shape: FoundationDB plus the three roles as
-# three separate containers, each a copy of the *same* image with a different
-# UPF_ROLES. They never talk to each other directly — only through FDB.
+# The whole UPF stack in containers — the one way to run it (Linux and macOS).
+# FoundationDB, the three roles, the load generator, and a dev/test service, all
+# coordinating only through FDB. Driven by the Justfile:
 #
-#   docker compose up --build        # (or: podman compose up --build)
+#   just build            # build the images
+#   just up [procs]       # FDB + writer + pusher + janitor  (procs=1 memory by default)
+#   just up 4 ssd         # multi-process ssd FDB for benching
+#   just bench topics=... # run loadgen (container) against the roles
+#   just test             # cargo test in the dev container against FDB
+#   just down             # stop + wipe
 #
-# UPF speaks ntfy's protocol:
-#   Distributors subscribe on the pusher:  ws://localhost:8081/{topic}/ws
-#   App servers publish to the writer:      http://localhost:8080/{topic}?up=1
-#
-# NOTE: ntfy uses one base URL for both publish and subscribe. A real distributor
-# configured with base URL X publishes to X/{topic} AND subscribes at X/{topic}/ws,
-# so a split deployment needs an ingress routing /{topic}/ws|json|sse -> pusher and
-# everything else -> writer. The single all-roles process (scripts/cargo.sh run)
-# serves both at one URL and is the simplest target for a real distributor.
+# UPF speaks ntfy: publish to the writer (http://localhost:8080/{topic}?up=1),
+# subscribe on the pusher (ws://localhost:8081/{topic}/ws). Inside the network the
+# roles are writer:8080 and pusher:8080 (the 8081 is only the host-published port).
 
 name: upf
 
-# Shared config for the three role containers: one image, one FDB cluster file,
-# one shard count (the writer→pusher poke requires an identical K on both sides).
+# Shared config for the three role containers: one image, one cluster file, one
+# shard count (the writer->pusher poke needs an identical K on both sides).
 x-upf-role: &upf-role
   image: upf:local
   build:
@@ -31,48 +30,36 @@ x-upf-role: &upf-role
   environment: &upf-env
     FDB_CLUSTER_FILE: /var/fdb/fdb.cluster
     UPF_SHARD_COUNT: "64"
-    RUST_LOG: upf=debug,info
+    RUST_LOG: upf=info
   restart: unless-stopped
 
 services:
-  # ---- FoundationDB (the only stateful infrastructure) --------------------
+  # ---- FoundationDB (FDB_PROCS processes on FDB_ENGINE) --------------------
   fdb:
-    image: docker.io/foundationdb/foundationdb:7.3.78
-    environment:
-      # Advertise the container's own IP so peers on this network can reach it;
-      # the cluster file (shared via the `fdb` volume) is written accordingly.
-      FDB_NETWORKING_MODE: container
+    build:
+      context: .
+      dockerfile: Containerfile.fdb
+    image: upf-fdb:local
     volumes:
       - fdb:/var/fdb
+    environment:
+      FDB_PROCS: ${FDB_PROCS:-1}
     restart: unless-stopped
 
-  # One-shot: wait for fdbserver, then create a single-node in-memory database.
-  # Completing successfully is the gate the role containers wait on.
+  # One-shot: create + size the database; the gate the roles wait on.
   fdb-init:
-    image: docker.io/foundationdb/foundationdb:7.3.78
+    image: upf-fdb:local
     depends_on:
       - fdb
     volumes:
       - fdb:/var/fdb
     environment:
-      FDB_CLUSTER_FILE: /var/fdb/fdb.cluster
+      FDB_PROCS: ${FDB_PROCS:-1}
+      FDB_ENGINE: ${FDB_ENGINE:-memory}
+    entrypoint: ["/usr/local/bin/fdb-init.sh"]
     restart: "no"
-    entrypoint:
-      - bash
-      - -c
-      - |
-        set -e
-        echo "waiting for fdbserver..."
-        for _ in $(seq 1 60); do
-          if fdbcli --exec 'status minimal' >/dev/null 2>&1; then break; fi
-          sleep 1
-        done
-        # Idempotent: harmless error if the database is already configured.
-        fdbcli --exec 'configure new single memory' || true
-        fdbcli --exec 'status minimal'
-        echo "foundationdb ready."
 
-  # ---- Writer: ntfy publish surface, POST/PUT /{topic} --------------------
+  # ---- the three roles (one image, three configs) -------------------------
   writer:
     <<: *upf-role
     environment:
@@ -81,23 +68,57 @@ services:
     ports:
       - "8080:8080" # app servers publish here (POST /{topic}?up=1)
 
-  # ---- Pusher: ntfy subscription delivery (/{topic}/ws|json|sse) ----------
   pusher:
     <<: *upf-role
     environment:
       <<: *upf-env
       UPF_ROLES: pusher
-      # Stable identity so affinity/bell ownership survives restarts.
-      UPF_NODE_ID: pusher-1
+      UPF_NODE_ID: pusher-1 # stable identity: affinity/bell ownership survives restarts
     ports:
       - "8081:8080" # distributors subscribe here (/{topic}/ws)
 
-  # ---- Janitor: TTL expiry + dead-node sweeps -----------------------------
   janitor:
     <<: *upf-role
     environment:
       <<: *upf-env
       UPF_ROLES: janitor
 
+  # ---- load generator (bench profile) -------------------------------------
+  # Runs the loadgen binary baked into the upf image, against the roles by
+  # service name. `just bench ARGS` overrides the command with key=value args.
+  loadgen:
+    image: upf:local
+    profiles: [bench]
+    depends_on:
+      - writer
+      - pusher
+    entrypoint: ["/usr/local/bin/loadgen"]
+    command:
+      - http_base=http://writer:8080
+      - ws_base=ws://pusher:8080
+
+  # ---- dev / test (dev profile) -------------------------------------------
+  # A build container with cargo + libfdb_c and the source mounted, joined to the
+  # network so `cargo test` reaches FDB. `just test` runs `cargo test` here.
+  dev:
+    profiles: [dev]
+    build:
+      context: .
+      dockerfile: Containerfile.dev
+    depends_on:
+      fdb-init:
+        condition: service_completed_successfully
+    volumes:
+      - .:/work:Z
+      - fdb:/var/fdb
+      - cargo-home:/work/.cargo-home
+    working_dir: /work
+    environment:
+      FDB_CLUSTER_FILE: /var/fdb/fdb.cluster
+      CARGO_HOME: /work/.cargo-home
+      RUST_LOG: upf=info
+    command: ["cargo", "test"]
+
 volumes:
   fdb:
+  cargo-home:

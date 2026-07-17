@@ -18,7 +18,10 @@ COPY --from=docker.io/foundationdb/foundationdb:7.3.78 \
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-RUN cargo build --release --locked --bin upf
+COPY examples ./examples
+# Build the server and the load generator (the bench harness runs loadgen from
+# this same image, so the whole stack is containers — no host toolchain).
+RUN cargo build --release --locked --bin upf --example loadgen
 
 # ---- runtime ---------------------------------------------------------------
 FROM docker.io/library/debian:bookworm-slim AS runtime
@@ -31,7 +34,9 @@ RUN apt-get update \
 COPY --from=docker.io/foundationdb/foundationdb:7.3.78 \
      /usr/lib/libfdb_c.so /usr/lib/libfdb_c.so
 COPY --from=builder /src/target/release/upf /usr/local/bin/upf
+COPY --from=builder /src/target/release/examples/loadgen /usr/local/bin/loadgen
 
 ENV UPF_BIND=0.0.0.0:8080
 EXPOSE 8080
+# Default entrypoint is the server; the loadgen service overrides it.
 ENTRYPOINT ["/usr/local/bin/upf"]

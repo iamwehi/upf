@@ -195,41 +195,34 @@ remember the last `id`, and on reconnect pass `since=<id>`.
 
 ## Running locally
 
-The [`Justfile`](./Justfile) (`just --list`) is the one interface, and it
-dispatches per OS:
-
-- **Linux** — FoundationDB has a native client library, so `cargo` builds
-  directly and FDB runs natively under systemd. No container.
-- **macOS** — no native arm64 FDB client lib, so builds run in a Linux dev
-  container (linking `libfdb_c` from the FDB image) and FDB runs in a podman pod.
-  The same recipes transparently call the `scripts/` (podman) under the hood.
+The whole stack runs in containers via [`compose.yaml`](./compose.yaml), driven
+by the [`Justfile`](./Justfile) (`just --list`) — one way, identical on Linux and
+macOS, no host toolchain. FoundationDB, the three roles, the load generator, and
+even the test runner are all containers coordinating only through FDB.
 
 ```sh
-just setup            # deps: apt on Linux; verifies podman on macOS
-just install-fdb      # FoundationDB (Linux only; a no-op note on macOS)
-just fdb-single       # a FoundationDB to develop against
-just build            # release build of the server + loadgen
-just test             # unit + e2e tests
-just run              # all roles on :8080   (just run pusher — a single role)
-just fdb-down         # tear FDB down
+just setup            # verify podman + a compose provider
+just build            # build the images (server+loadgen, FDB, dev)
+just up               # FDB + writer + pusher + janitor  (1 proc, in-memory)
+just test             # unit + e2e tests (cargo test in a container against FDB)
+just down             # stop + wipe
 ```
 
-On macOS you can still call the scripts directly (`scripts/dev-up.sh`,
-`scripts/cargo.sh …`, `scripts/dev-down.sh`) — that's what `just` invokes there.
-For benchmarking against a multi-process FDB, see **[BENCHING.md](./BENCHING.md)**.
+After a code change, `just build` again (image rebuild), then `just up`. Publish
+to the writer on `:8080`, subscribe on the pusher on `:8081`. For benchmarking
+against a multi-process FDB, see **[BENCHING.md](./BENCHING.md)**.
 
-Manual smoke test with `curl` (talk to the all-roles server on `:8080`):
+Manual smoke test with `curl` (writer on `:8080`, pusher on `:8081`):
 
 ```sh
 T=upDEMO0001
-# subscribe (prints open + messages); or use the bundled mock:
-#   UPF_TOPIC=$T cargo run --example mock_distributor
-curl -N "http://localhost:8080/$T/json" &
-# publish (UnifiedPush raw mode):
+# subscribe on the pusher (prints open + messages):
+curl -N "http://localhost:8081/$T/json" &
+# publish on the writer (UnifiedPush raw mode):
 curl -X POST --data 'hi there' "http://localhost:8080/$T?up=1"
 # offline replay: publish with nobody listening, then resume from the start:
 curl -X POST --data 'while offline' "http://localhost:8080/$T?up=1"
-curl "http://localhost:8080/$T/json?since=all&poll=1"
+curl "http://localhost:8081/$T/json?since=all&poll=1"
 ```
 
 ### With the real ntfy Android app
@@ -251,16 +244,14 @@ timestamp; every subscriber then asserts it received that stream **in order, wit
 no gaps and no duplicates**, and records send→receive latency.
 
 ```sh
-# Linux: run the server (`just run`) in one shell, then drive it:
-just bench                                    # loadgen defaults (1000 topics, 2000/s, 30s)
+just up                                     # bring up FDB + roles
+just bench                                  # loadgen defaults (1000 topics, 2000/s, 30s)
 just bench topics=2000 rate=6000 duration=20  # args pass straight to loadgen
-just bench-sweep 2000 20                       # sweep rates to find the knee
-
-# macOS dev container equivalent:
-scripts/cargo.sh run --release --example loadgen -- topics=2000 rate=6000 duration=20
+just bench-sweep 2000 20                     # sweep rates to find the knee
 ```
 
-For benchmarking against a multi-process FDB on a real Linux host, see
+The `loadgen` container drives the roles by service name over the compose
+network. For benchmarking against a multi-process FDB, see
 **[BENCHING.md](./BENCHING.md)**.
 
 It prints a live per-second line and a final report with throughput, a bounded
@@ -279,35 +270,30 @@ Two things to know when reading the output:
   message still arrives exactly once, in order. That's the durable-queue design
   working as intended.
 
-> Correctness results (loss/order/dup) from the single-node **in-memory** FDB in
-> `dev-up.sh` are fully valid. The **throughput/latency numbers are not** capacity
-> figures — a real multi-process `ssd` cluster (and pushers on their own nodes)
-> moves the knee substantially.
+> Correctness results (loss/order/dup) from the default single-process **in-memory**
+> FDB (`just up`) are fully valid. The **throughput/latency numbers are not**
+> capacity figures — a multi-process `ssd` cluster (`just up 8 ssd`, and pushers on
+> their own nodes) moves the knee substantially.
 
 ---
 
-## Running as separate containers (`compose.yaml`)
+## The deployment shape (`compose.yaml`)
 
-`scripts/cargo.sh run` is a single all-roles process. `compose.yaml` runs the
-real deployment shape: FoundationDB plus **writer, pusher and janitor as three
-separate containers** — each the *same* image (`Containerfile`) with a different
-`UPF_ROLES`. They share nothing but the database.
-
-```sh
-docker compose up --build      # or: podman compose up --build
-```
+`just up` runs the real deployment shape: FoundationDB plus **writer, pusher and
+janitor as three separate containers** — each the *same* image (`Containerfile`)
+with a different `UPF_ROLES`. They share nothing but the database.
 
 - **writer** — published on `localhost:8080`; app servers `POST /{topic}` here.
 - **pusher** — published on `localhost:8081`; distributors subscribe at
   `/{topic}/ws`.
 - **janitor** — no ports; runs TTL expiry + sweeps.
-- **fdb** + **fdb-init** — the database and a one-shot that configures it; the
-  role containers wait on `fdb-init` completing.
+- **fdb** + **fdb-init** — FoundationDB (`FDB_PROCS` processes on `FDB_ENGINE`)
+  and a one-shot that creates + sizes the DB; the roles wait on it completing.
 
 Invariants the file encodes: writer and pusher share an identical
 `UPF_SHARD_COUNT` (the poke addresses a shard both sides must agree on), and the
 pusher has a stable `UPF_NODE_ID` so affinity/bell ownership survives restarts.
-Scale a role with `docker compose up --scale pusher=3` — because coordination is
+Scale a role with `podman compose up --scale pusher=3` — because coordination is
 entirely in FDB, added pushers are immediately live.
 
 > **Single base URL.** ntfy uses one origin for both publish and subscribe, so a

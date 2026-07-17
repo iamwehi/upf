@@ -1,129 +1,86 @@
-# Benchmarking UPF on a native Linux host
+# Benchmarking UPF
 
-On Linux, FoundationDB has a native client library, so UPF builds and runs
-**without any container** — `cargo` links against the locally-installed
-`libfdb_c.so`, and the FDB server runs natively under systemd. This removes the
-build-container indirection the macOS dev flow needs (`scripts/`), and — more
-importantly for benching — lets FDB, the app, and the load generator each use
-real cores instead of fighting over a small shared VM.
+The whole stack runs in containers via [`compose.yaml`](./compose.yaml) — FDB,
+the three roles, and the load generator — so benching is the same everywhere. On
+a **native Linux host** the containers are just namespaced host processes (no
+VM), so FDB, the roles, and loadgen each use real cores; that's where throughput
+numbers mean something. On macOS everything runs inside the podman VM (a few
+shared cores), so treat those numbers as correctness-only.
 
-Everything below is driven by the [`Justfile`](./Justfile) (`just --list`).
+Everything is driven by the [`Justfile`](./Justfile) (`just --list`).
 
 ## 0. Prerequisites
 
-A Debian/Ubuntu host with `sudo`, plus:
+- `podman` and a compose provider (`podman-compose` — `pip install podman-compose`
+  — or `docker compose`; override with `COMPOSE="docker compose"`).
+- `just` (`cargo install just`, `apt install just`, or `snap install --classic just`).
+
+Clone the repo and `cd` in. `just setup` verifies the above.
+
+## 1. Build the images
 
 ```sh
-# Rust toolchain (if not already present)
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-
-# just (the task runner)
-cargo install just         # or: apt install just / snap install --classic just
+just build      # server + loadgen image, FDB image, dev image
 ```
 
-Clone the repo and `cd` into it. All `just` recipes run from the repo root.
+Re-run this after any code change (the bench runs the built image, not source).
 
-## 1. Install dependencies and FoundationDB
+## 2. Bring up a multi-process FDB + the roles
 
 ```sh
-just setup          # clang/libclang, build-essential, curl
-just install-fdb    # FoundationDB client + server .debs (matches the pinned version)
+just up 8 ssd   # 8 fdbserver processes on the ssd engine, + writer/pusher/janitor
 ```
 
-`install-fdb` leaves a working single-process DB running (the server package
-auto-configures one). Confirm:
-
-```sh
-just fdb-status
-```
-
-## 2. Build and (optionally) test
-
-```sh
-just build          # release build of the server + loadgen
-
-just fdb-single     # single-process in-memory DB — the correctness engine
-just test           # unit + e2e tests against it
-```
-
-## 3. Stand up a multi-process FDB for benching
-
-```sh
-just fdb-bench 8    # 8 fdbserver processes, ssd engine, logs/proxies sized to 8
-```
-
-This regenerates `/etc/foundationdb/foundationdb.conf` from
-[`fdb/foundationdb.conf`](./fdb/foundationdb.conf) with N process sections,
-restarts FDB, and sizes the transaction subsystem. Pick N based on the box —
-roughly one process per core, leaving a couple of cores for the app and the load
-generator (which also run on this host unless you split across machines; see
-§6). It **wipes** the DB; bench data is disposable.
-
-Verify the process count and roles:
+`up N ssd` runs N host-networked `fdbserver` processes in the `fdb` container,
+creates the DB on `ssd`, and sizes logs/proxies to N (the rest serve storage).
+Pick N by the box — roughly one process per core, leaving a couple for the roles
+and loadgen. (`just up` with no args is 1 process / in-memory — the fast
+correctness default.) Confirm the process count and roles:
 
 ```sh
 just fdb-status
 ```
 
-## 4. Run the server, then drive it
-
-Two terminals (or `tmux`):
+## 3. Drive it
 
 ```sh
-# terminal 1 — the all-roles server on :8080
-just run
-
-# terminal 2 — the load generator
-just bench topics=2000 rate=20000 duration=20
+just bench topics=2000 rate=20000 duration=20    # one run
+just bench-sweep 2000 20                          # sweep rate = 2k…80k, 20s each
 ```
 
-`bench` passes its args straight to the load generator as `key=value`
-(`topics`, `subs`, `rate`, `duration`, `payload`, `http_base`, `ws_base`, …);
-with no args, loadgen's own defaults apply (1000 topics, 2000/s, 30s). See the
-top of [`examples/loadgen.rs`](./examples/loadgen.rs) for every knob.
+`bench` runs the `loadgen` container against the roles by service name; args pass
+straight through as `key=value` (`topics`, `subs`, `rate`, `duration`, `payload`,
+…; see the top of [`examples/loadgen.rs`](./examples/loadgen.rs)). It prints a
+live per-second line and a final report: throughput, a latency histogram
+(p50/p90/p95/p99/max), and a correctness verdict (loss / order / dup / gaps).
 
-To find the throughput knee in one shot:
-
-```sh
-just bench-sweep 2000 20     # sweeps rate = 2k…80k against 2000 topics, 20s each
-```
-
-## 5. Watch where the load actually lands
+## 4. Watch where the load actually lands
 
 The point of a bench is knowing *what* saturates. While a run is in flight:
 
 ```sh
-watch -n1 'fdbcli --exec "status" | sed -n "/Workload:/,/Backup/p"'   # FDB txn/read/write/conflict rates
-fdbcli --exec "status details" | grep 127.0.0.1                        # per-process CPU/disk
-top    # or htop — is it the app, loadgen, or fdb eating cores?
+watch -n1 'just fdb-status | sed -n "/Workload:/,/Backup/p"'   # FDB txn/read/write rates
+just fdb-status | grep :450                                    # per-process CPU/disk
+podman stats --no-stream                                       # per-container CPU/mem
 ```
 
 If FDB shows low CPU and headroom while delivery lags publish, the limit is the
-app's delivery path, not the database — bump `just fdb-bench` won't help, and the
-pusher is where to look. (That was exactly the finding on the small dev VM.)
+app's delivery path, not the database — scaling FDB won't help, and the pusher is
+where to look. (That was the finding on the small dev VM: FDB was never the
+bottleneck there.)
 
-## 6. Splitting roles / machines (closer to production)
+## 5. Scaling and splitting
 
-**Split roles on one box** — give each its own port, point loadgen at both:
+- **More pushers:** `podman compose up -d --scale pusher=3` — because coordination
+  is entirely in FDB, added pushers are immediately live. (Put an ingress in front
+  routing `/{topic}/ws|json|sse` → pushers and everything else → writer.)
+- **Across machines (the only true capacity test).** Run FDB on its own host(s),
+  the roles on another, and loadgen from a third, so nothing cannibalizes anyone
+  else's cores. Point the roles at FDB via the shared cluster file and loadgen at
+  the roles via `http_base`/`ws_base`.
 
-```sh
-UPF_BIND=0.0.0.0:8080 just run-writer      # terminal 1
-UPF_BIND=0.0.0.0:8081 just run-pusher      # terminal 2
-UPF_BIND=0.0.0.0:8082 just run-janitor     # terminal 3 (no HTTP surface, but binds)
-just bench http_base=http://localhost:8080 ws_base=ws://localhost:8081 \
-           topics=2000 rate=20000 duration=20
-```
-
-**Across machines (rung 4 — the only true capacity test).** Run FDB on its own
-host(s), copy `/etc/foundationdb/fdb.cluster` to the app host(s) (or set
-`FDB_CLUSTER_FILE`), run writer/pusher there, and run loadgen from a *third*
-host pointed at their addresses via `http_base`/`ws_base`. Now nothing
-cannibalizes anyone else's cores, and the numbers mean something.
-
-## 7. Teardown
+## 6. Teardown
 
 ```sh
-just fdb-single     # back to a single in-memory process
-# or stop FDB entirely:
-sudo systemctl stop foundationdb
+just down       # stop everything and wipe the volumes
 ```

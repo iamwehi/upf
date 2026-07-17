@@ -1,0 +1,10 @@
+# FoundationDB image for the local stack: the stock FDB image plus our
+# launch/init scripts, so the compose `fdb` service can run one *or many*
+# fdbserver processes (FDB_PROCS) on the chosen engine (FDB_ENGINE). Keeping the
+# logic in scripts (not inline compose YAML) makes it testable with plain podman.
+FROM docker.io/foundationdb/foundationdb:7.3.78
+
+COPY docker/fdb-run.sh docker/fdb-init.sh /usr/local/bin/
+RUN chmod +x /usr/local/bin/fdb-run.sh /usr/local/bin/fdb-init.sh
+
+ENTRYPOINT ["/usr/local/bin/fdb-run.sh"]
