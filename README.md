@@ -195,17 +195,28 @@ remember the last `id`, and on reconnect pass `since=<id>`.
 
 ## Running locally
 
-FoundationDB has no native macOS-arm64 client library, so the build and tests run
-inside a Linux container that links `libfdb_c` copied from the matching FDB image.
-Everything is driven by scripts (podman).
+The [`Justfile`](./Justfile) (`just --list`) is the one interface, and it
+dispatches per OS:
+
+- **Linux** — FoundationDB has a native client library, so `cargo` builds
+  directly and FDB runs natively under systemd. No container.
+- **macOS** — no native arm64 FDB client lib, so builds run in a Linux dev
+  container (linking `libfdb_c` from the FDB image) and FDB runs in a podman pod.
+  The same recipes transparently call the `scripts/` (podman) under the hood.
 
 ```sh
-scripts/dev-up.sh          # start FDB in a pod, init the DB, build the dev image
-scripts/cargo.sh build     # build inside the dev container
-scripts/cargo.sh test      # unit + e2e tests against the live FDB
-scripts/cargo.sh run       # run all roles on the pod's :8080
-scripts/dev-down.sh        # tear the pod down
+just setup            # deps: apt on Linux; verifies podman on macOS
+just install-fdb      # FoundationDB (Linux only; a no-op note on macOS)
+just fdb-single       # a FoundationDB to develop against
+just build            # release build of the server + loadgen
+just test             # unit + e2e tests
+just run              # all roles on :8080   (just run pusher — a single role)
+just fdb-down         # tear FDB down
 ```
+
+On macOS you can still call the scripts directly (`scripts/dev-up.sh`,
+`scripts/cargo.sh …`, `scripts/dev-down.sh`) — that's what `just` invokes there.
+For benchmarking against a multi-process FDB, see **[BENCHING.md](./BENCHING.md)**.
 
 Manual smoke test with `curl` (talk to the all-roles server on `:8080`):
 
@@ -240,14 +251,17 @@ timestamp; every subscriber then asserts it received that stream **in order, wit
 no gaps and no duplicates**, and records send→receive latency.
 
 ```sh
-# defaults: 1000 topics, 1 sub each, 2000 publishes/sec, for 30s
-scripts/cargo.sh run --release --example loadgen
+# Linux: run the server (`just run`) in one shell, then drive it:
+just bench                                    # loadgen defaults (1000 topics, 2000/s, 30s)
+just bench topics=2000 rate=6000 duration=20  # args pass straight to loadgen
+just bench-sweep 2000 20                       # sweep rates to find the knee
 
-# knobs are `key=value` args after `--` (env vars are NOT forwarded into the
-# dev container, but args are):
-scripts/cargo.sh run --release --example loadgen -- \
-    topics=2000 subs=1 rate=6000 duration=20
+# macOS dev container equivalent:
+scripts/cargo.sh run --release --example loadgen -- topics=2000 rate=6000 duration=20
 ```
+
+For benchmarking against a multi-process FDB on a real Linux host, see
+**[BENCHING.md](./BENCHING.md)**.
 
 It prints a live per-second line and a final report with throughput, a bounded
 latency histogram (p50/p90/p95/p99/max), and a correctness verdict (loss /

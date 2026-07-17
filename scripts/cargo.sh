@@ -20,4 +20,6 @@ exec podman run --rm "${TTY[@]}" --pod "$POD" \
   -e UPF_PUBLIC_URL="${UPF_PUBLIC_URL:-http://localhost:8080}" \
   -e CARGO_HOME=/work/.cargo-home \
   -e RUST_LOG="${RUST_LOG:-upf=debug,info}" \
+  ${UPF_ROLES:+-e UPF_ROLES="$UPF_ROLES"} \
+  ${UPF_BIND:+-e UPF_BIND="$UPF_BIND"} \
   "$DEV_IMAGE" cargo "$@"

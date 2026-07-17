@@ -25,12 +25,15 @@
 //! LOADGEN_DURATION_SECS=30 scripts/cargo.sh run --release --example loadgen
 //! ```
 //!
-//! Knobs — pass as `key=value` args after `--` (these flow through the dev
-//! container, unlike env vars, which `scripts/cargo.sh` does not forward):
+//! Knobs — pass as `key=value` args after `--`:
 //!
 //! ```text
-//! scripts/cargo.sh run --release --example loadgen -- \
-//!     topics=1000 subs=1 rate=2000 duration=30
+//! # native Linux (see BENCHING.md):
+//! just bench topics=1000 subs=1 rate=2000 duration=30
+//! cargo run --release --example loadgen -- topics=1000 rate=2000
+//!
+//! # macOS dev container (env vars are NOT forwarded, but args after `--` are):
+//! scripts/cargo.sh run --release --example loadgen -- topics=1000 rate=2000
 //! ```
 //!
 //!   http_base   publish target base       (default http://localhost:8080)
