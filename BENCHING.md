@@ -11,8 +11,9 @@ Everything is driven by the [`Justfile`](./Justfile) (`just --list`).
 
 ## 0. Prerequisites
 
-- `podman` and a compose provider (`podman-compose` — `pip install podman-compose`
-  — or `docker compose`; override with `COMPOSE="docker compose"`).
+- `podman` and a compose provider: `podman-compose` (`brew install podman-compose`
+  on macOS, or `pip install podman-compose`) or `docker compose` (override with
+  `COMPOSE="docker compose"`).
 - `just` (`cargo install just`, `apt install just`, or `snap install --classic just`).
 
 Clone the repo and `cd` in. `just setup` verifies the above.

@@ -31,7 +31,7 @@ setup:
     #!/usr/bin/env bash
     set -euo pipefail
     command -v podman >/dev/null || { echo "install podman first"; exit 1; }
-    {{compose}} version >/dev/null 2>&1 || { echo "install a compose provider: podman-compose (pip install podman-compose) or docker compose"; exit 1; }
+    {{compose}} version >/dev/null 2>&1 || { echo "install a compose provider: podman-compose (brew install podman-compose, or pip install podman-compose) or docker compose"; exit 1; }
     echo "ok: $({{compose}} version 2>/dev/null | head -1)"
 
 # Build the images (server+loadgen, FDB, dev). Re-run after code changes.

@@ -86,9 +86,10 @@ services:
   # ---- load generator (bench profile) -------------------------------------
   # Runs the loadgen binary baked into the upf image, against the roles by
   # service name. `just bench ARGS` overrides the command with key=value args.
+  # Not started by `just up` (which lists services explicitly); run on demand
+  # via `just bench`. Profiles are avoided for podman-compose compatibility.
   loadgen:
     image: upf:local
-    profiles: [bench]
     depends_on:
       - writer
       - pusher
@@ -97,17 +98,14 @@ services:
       - http_base=http://writer:8080
       - ws_base=ws://pusher:8080
 
-  # ---- dev / test (dev profile) -------------------------------------------
+  # ---- dev / test ---------------------------------------------------------
   # A build container with cargo + libfdb_c and the source mounted, joined to the
-  # network so `cargo test` reaches FDB. `just test` runs `cargo test` here.
+  # network so `cargo test` reaches FDB. `just test` runs `cargo test` here (bring
+  # the stack up first with `just up`). Not started by `just up`.
   dev:
-    profiles: [dev]
     build:
       context: .
       dockerfile: Containerfile.dev
-    depends_on:
-      fdb-init:
-        condition: service_completed_successfully
     volumes:
       - .:/work:Z
       - fdb:/var/fdb
