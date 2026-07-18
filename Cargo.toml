@@ -30,6 +30,7 @@ futures-util = "0.3"
 [dev-dependencies]
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect"] }
 reqwest = { version = "0.12", default-features = false, features = ["json"] }
+proptest = "1"
 
 # Line-tables-only debuginfo keeps linker memory in check inside the (RAM-limited)
 # dev container while still giving usable backtraces.

@@ -144,3 +144,76 @@ impl Keyspace {
         Ok(node)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    // Topics are validated upstream (see `ids::valid_topic`); generate from that
+    // same alphabet so these properties cover exactly the keys we really pack.
+    fn topic() -> impl Strategy<Value = String> {
+        "[-_A-Za-z0-9]{1,64}"
+    }
+
+    proptest! {
+        /// The message id a subscriber sees *is* the queue versionstamp, so a
+        /// `Q` key must decode back to the exact stamp it was built from — this
+        /// is what makes `since=<id>` land on the right log entry.
+        #[test]
+        fn queue_key_round_trips(topic in topic(), tx: [u8; 10], uv: u16) {
+            let ks = Keyspace::new();
+            let vs = Versionstamp::complete(tx, uv);
+            let key = ks.queue_msg(&topic, &vs);
+            let back = ks.queue_key_versionstamp(&key)?;
+            prop_assert_eq!(back.as_bytes(), vs.as_bytes());
+        }
+
+        /// The liveness registry key decodes back to its node id.
+        #[test]
+        fn liveness_key_round_trips(node in topic()) {
+            let ks = Keyspace::new();
+            let back = ks.liveness_node(&ks.liveness(&node))?;
+            prop_assert_eq!(back, node);
+        }
+
+        /// The janitor scans the TTL index in expiry order and stops at `now`,
+        /// which only works if byte order matches numeric expiry order. Range is
+        /// bounded to realistic epoch-seconds (< ~2106) — beyond `i64::MAX` the
+        /// `as i64` cast wraps, but no real expiry approaches that.
+        #[test]
+        fn ttl_keys_preserve_expiry_order(
+            a in 0u64..=u32::MAX as u64,
+            b in 0u64..=u32::MAX as u64,
+            topic in topic(),
+        ) {
+            let ks = Keyspace::new();
+            let ka = ks.ttl_append(a, &topic);
+            let kb = ks.ttl_append(b, &topic);
+            prop_assert_eq!(a <= b, ka <= kb);
+        }
+
+        /// A TTL entry is "due" (inside `ttl_range_due(now)`) exactly when its
+        /// expiry is `<= now` — the boundary the janitor's `now + 1` end key
+        /// depends on. Uses concrete complete keys so we can byte-compare.
+        #[test]
+        fn ttl_range_due_includes_iff_expired(
+            expiry in 0u64..=u32::MAX as u64,
+            now in 0u64..=u32::MAX as u64,
+            topic in topic(),
+        ) {
+            let ks = Keyspace::new();
+            // A complete TTL key at `expiry` (same tuple shape as ttl_append,
+            // but with a concrete stamp so ordering is fully determined).
+            let key = ks.root.pack(&(
+                X,
+                expiry as i64,
+                topic.as_str(),
+                Versionstamp::complete([0; 10], 0),
+            ));
+            let (begin, end) = ks.ttl_range_due(now);
+            let in_range = key.as_slice() >= begin.as_slice() && key.as_slice() < end.as_slice();
+            prop_assert_eq!(in_range, expiry <= now);
+        }
+    }
+}

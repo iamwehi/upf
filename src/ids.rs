@@ -86,4 +86,42 @@ mod tests {
         assert_ne!(a, b);
         assert!(a.chars().all(|c| c.is_ascii_alphanumeric()));
     }
+
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Any complete versionstamp survives a round-trip through the message id.
+        /// This is the contract behind `?since=<id>` resume: the id a subscriber
+        /// echoes back must decode to the exact `Q` key it came from.
+        #[test]
+        fn msg_id_round_trips(tx_bytes: [u8; 10], user_version: u16) {
+            let vs = Versionstamp::complete(tx_bytes, user_version);
+            let back = decode_msg_id(&encode_msg_id(&vs))?;
+            prop_assert_eq!(back.as_bytes(), vs.as_bytes());
+        }
+
+        /// `decode_msg_id` is fed straight from a client's `?since=` param, so it
+        /// must never panic on arbitrary input — only ever `Ok` or `Err`.
+        #[test]
+        fn decode_msg_id_never_panics(s in ".*") {
+            let _ = decode_msg_id(&s);
+        }
+
+        /// A string built from exactly the allowed alphabet, within the length
+        /// bound, is always a valid topic.
+        #[test]
+        fn generated_valid_topics_are_valid(topic in "[-_A-Za-z0-9]{1,64}") {
+            prop_assert!(valid_topic(&topic));
+        }
+
+        /// Oracle: `valid_topic` agrees with an independent restatement of the
+        /// rule for *any* string, so it can't drift from its own spec.
+        #[test]
+        fn valid_topic_matches_spec(s in ".*") {
+            let expected = !s.is_empty()
+                && s.len() <= MAX_TOPIC_LEN
+                && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+            prop_assert_eq!(valid_topic(&s), expected);
+        }
+    }
 }

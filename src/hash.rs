@@ -40,4 +40,17 @@ mod tests {
             assert_eq!(s, shard_of(tok, 64));
         }
     }
+
+    use proptest::prelude::*;
+
+    proptest! {
+        /// A shard index is always in range and stable — a writer and a pusher on
+        /// different nodes must land on the same shard for the same token.
+        #[test]
+        fn shard_is_in_range_and_deterministic(token: String, shard_count in 1u32..4096) {
+            let s = shard_of(&token, shard_count);
+            prop_assert!(s < shard_count);
+            prop_assert_eq!(s, shard_of(&token, shard_count));
+        }
+    }
 }
