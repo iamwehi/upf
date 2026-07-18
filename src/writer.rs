@@ -134,8 +134,14 @@ fn truthy(v: Option<&str>) -> bool {
     )
 }
 
+/// First few chars of a topic, for compact log lines. Truncates on a *char*
+/// boundary — a byte-index slice would panic on a multibyte char (topics are
+/// validated ASCII before publish, but this helper must not depend on that).
 fn short(topic: &str) -> &str {
-    &topic[..topic.len().min(8)]
+    match topic.char_indices().nth(8) {
+        Some((idx, _)) => &topic[..idx],
+        None => topic,
+    }
 }
 
 fn now_secs() -> u64 {
@@ -143,4 +149,109 @@ fn now_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderMap;
+    use proptest::prelude::*;
+
+    // ---- encode_body: the ntfy body auto-detection contract -----------------
+
+    proptest! {
+        /// Any valid UTF-8 body passes through as text (never base64). In raw
+        /// UnifiedPush mode it is byte-for-byte; otherwise it is trimmed like ntfy.
+        #[test]
+        fn encode_body_utf8_passes_through(s in ".*", up: bool) {
+            let (message, encoding) = encode_body(s.as_bytes(), up);
+            prop_assert_eq!(&encoding, "");
+            if up {
+                prop_assert_eq!(message, s);
+            } else {
+                prop_assert_eq!(message, s.trim());
+            }
+        }
+
+        /// The reverse contract: a body is base64-encoded **iff** it is not valid
+        /// UTF-8, and that base64 decodes back to the exact original bytes — so a
+        /// binary WebPush payload survives publish → delivery intact.
+        #[test]
+        fn encode_body_binary_round_trips(bytes in any::<Vec<u8>>(), up: bool) {
+            let (message, encoding) = encode_body(&bytes, up);
+            if std::str::from_utf8(&bytes).is_ok() {
+                prop_assert_eq!(&encoding, "");
+            } else {
+                prop_assert_eq!(&encoding, "base64");
+                prop_assert_eq!(B64.decode(&message).unwrap(), bytes);
+            }
+        }
+    }
+
+    // ---- UnifiedPush detection & truthiness ---------------------------------
+
+    fn header(name: &'static str, value: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(name, value.parse().unwrap());
+        h
+    }
+
+    #[test]
+    fn truthy_recognizes_ntfy_flag_values() {
+        // Present-but-empty (`?up`) counts as true, as do the usual spellings,
+        // case-insensitively and after trimming.
+        for v in ["1", "true", "yes", "on", "", "TRUE", " Yes "] {
+            assert!(truthy(Some(v)), "{v:?} should be truthy");
+        }
+        for v in ["0", "false", "no", "off", "nope", "2"] {
+            assert!(!truthy(Some(v)), "{v:?} should be falsy");
+        }
+        assert!(!truthy(None));
+    }
+
+    #[test]
+    fn unifiedpush_detected_from_param_header_or_encoding() {
+        let no_params = PublishParams::default();
+
+        // Nothing set → not UnifiedPush.
+        assert!(!is_unifiedpush(&no_params, &HeaderMap::new()));
+
+        // `?up=1` query param.
+        let up_param = PublishParams {
+            up: Some("1".into()),
+            unifiedpush: None,
+        };
+        assert!(is_unifiedpush(&up_param, &HeaderMap::new()));
+
+        // `X-UnifiedPush: 1` header.
+        assert!(is_unifiedpush(&no_params, &header("x-unifiedpush", "1")));
+
+        // The RFC 8291 encrypted WebPush content-encoding.
+        assert!(is_unifiedpush(&no_params, &header("content-encoding", "aes128gcm")));
+
+        // A different content-encoding is not a UnifiedPush signal.
+        assert!(!is_unifiedpush(&no_params, &header("content-encoding", "gzip")));
+    }
+
+    // ---- tag parsing --------------------------------------------------------
+
+    #[test]
+    fn parse_tags_splits_trims_and_drops_empties() {
+        assert_eq!(parse_tags(&header("x-tags", "a, b ,,c")), vec!["a", "b", "c"]);
+        assert_eq!(parse_tags(&header("tags", "x")), vec!["x"]); // fallback header
+        assert_eq!(parse_tags(&HeaderMap::new()), Vec::<String>::new());
+    }
+
+    // ---- short(): the log-prefix helper -------------------------------------
+
+    proptest! {
+        /// `short` truncates a topic for logging. It must never panic on arbitrary
+        /// input — a byte-index slice would split a multibyte char and crash.
+        #[test]
+        fn short_never_panics(s in ".*") {
+            let out = short(&s);
+            prop_assert!(s.starts_with(out));
+            prop_assert!(out.chars().count() <= 8);
+        }
+    }
 }
